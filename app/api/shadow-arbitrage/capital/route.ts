@@ -1,0 +1,552 @@
+import { NextResponse } from "next/server";
+import { isSession } from "@/lib/requireApiAuth";
+import { requireAdminSession } from "@/lib/requireAdmin";
+import {
+  loadCapitalPlans,
+  loadLatestCapitalApproval,
+  loadLatestCapitalPlan,
+  loadLatestAccountConfirmations,
+  loadLatestSourceSnapshots,
+  getObservation,
+  loadRouteMetrics,
+  saveCapitalApproval,
+  saveCapitalPlan
+} from "@/db/repositories/shadowArbitrage";
+import { buildAllReadiness } from "@/lib/shadowArbitrage/accounts";
+import {
+  DEFAULT_CAPITAL_TOMAN,
+  MAX_CAPITAL_TOMAN,
+  MIN_CAPITAL_TOMAN,
+  buildOptimizedPlan,
+  classifyAllVenues,
+  planFingerprint,
+  readinessFingerprint,
+  simulateCapitalPlan,
+  smallestFundableSizeUsdt,
+  type ApprovalRecord,
+  type CapitalAllocation,
+  type CapitalPlanInput,
+  type RouteEvidence
+} from "@/lib/shadowArbitrage/capital";
+import { SHADOW_BANNER, SHADOW_SOURCES } from "@/lib/shadowArbitrage/config";
+import { getPaperSession } from "@/db/repositories/shadowPaper";
+import { loadEffectiveFees } from "@/lib/shadowArbitrage/effectiveFees";
+import { SHADOW_NO_STORE } from "@/lib/shadowArbitrage/httpHeaders";
+import type { ShadowSourceId } from "@/lib/shadowArbitrage/types";
+
+export const dynamic = "force-dynamic";
+export const runtime = "nodejs";
+
+/**
+ * Phase 5 — admin-only capital allocation simulator.
+ *
+ * Every balance this endpoint reads or writes is virtual. It never contacts an
+ * exchange, never accepts credentials, and has no code path that places an
+ * order or moves funds. Automatic paper execution is deliberately out of scope
+ * (Phase 6); nothing here schedules or simulates order flow.
+ */
+
+const VALID_IDS = new Set<string>(SHADOW_SOURCES.map((s) => s.id));
+
+/** Any of these in a request body is an immediate refusal. */
+const FORBIDDEN_FIELDS = [
+  "apiKey",
+  "api_key",
+  "secret",
+  "apiSecret",
+  "token",
+  "password",
+  "passphrase",
+  "privateKey",
+  "mnemonic"
+];
+
+function bad(message: string, error = "bad_request", status = 400) {
+  return new NextResponse(JSON.stringify({ error, message }), {
+    status,
+    headers: SHADOW_NO_STORE
+  });
+}
+
+/**
+ * Valuation price for USDT balances: the median mid-price across venues that
+ * reported both sides this cycle. Null when the market data cannot support it —
+ * the simulator then refuses to value USDT rather than guessing a price.
+ */
+function deriveValuationPrice(
+  snapshots: Array<{ userBuy: number | null; userSell: number | null; stale: boolean }>
+): number | null {
+  const mids = snapshots
+    .filter((s) => !s.stale && s.userBuy !== null && s.userSell !== null)
+    .map((s) => ((s.userBuy as number) + (s.userSell as number)) / 2)
+    .filter((n) => Number.isFinite(n) && n > 0)
+    .sort((a, b) => a - b);
+  if (!mids.length) return null;
+  const mid = Math.floor(mids.length / 2);
+  const value = mids.length % 2 ? mids[mid] : (mids[mid - 1] + mids[mid]) / 2;
+  return Math.round(value);
+}
+
+function toRouteEvidence(rows: Awaited<ReturnType<typeof loadRouteMetrics>>): RouteEvidence[] {
+  return rows.map((r) => ({
+    routeKey: r.routeKey,
+    buySourceId: r.buySourceId,
+    sellSourceId: r.sellSourceId,
+    sizeUsdt: r.sizeUsdt,
+    samples: r.samples,
+    positiveNetSamples: r.positiveNetSamples,
+    positiveRawSamples: r.positiveRawSamples,
+    feeUnknown: r.feeUnknown
+  }));
+}
+
+/** Reject anything that is not a clean, non-negative virtual balance. */
+function parseAllocations(raw: unknown): { ok: true; value: CapitalAllocation[] } | { ok: false; message: string } {
+  if (!Array.isArray(raw)) return { ok: false, message: "فهرست تخصیص نامعتبر است" };
+  if (raw.length > SHADOW_SOURCES.length) {
+    return { ok: false, message: "تعداد تخصیص‌ها بیش از تعداد صرافی‌های مجاز است" };
+  }
+  const out: CapitalAllocation[] = [];
+  for (const item of raw) {
+    if (!item || typeof item !== "object") return { ok: false, message: "ردیف تخصیص نامعتبر است" };
+    const rec = item as Record<string, unknown>;
+    const sourceId = String(rec.sourceId ?? "");
+    if (!VALID_IDS.has(sourceId)) {
+      return { ok: false, message: `صرافی «${sourceId}» در آربیتراژ آزمایشی مجاز نیست` };
+    }
+    const irt = Number(rec.irtToman ?? 0);
+    const usdt = Number(rec.usdtUnits ?? 0);
+    if (!Number.isFinite(irt) || !Number.isFinite(usdt) || irt < 0 || usdt < 0) {
+      return { ok: false, message: "موجودی منفی یا نامعتبر پذیرفته نمی‌شود" };
+    }
+    out.push({ sourceId: sourceId as ShadowSourceId, irtToman: irt, usdtUnits: usdt });
+  }
+  return { ok: true, value: out };
+}
+
+async function buildContext() {
+  const [effectiveFees, snapshots, routeRows, observation, savedPlan, history, approvalRow] =
+    await Promise.all([
+      loadEffectiveFees(Date.now()),
+      loadLatestSourceSnapshots(),
+      loadRouteMetrics(),
+      getObservation(),
+      loadLatestCapitalPlan(),
+      loadCapitalPlans(25),
+      loadLatestCapitalApproval()
+    ]);
+
+  const accountEvidence = await loadLatestAccountConfirmations();
+  const readiness = buildAllReadiness(
+    effectiveFees.overrides,
+    Date.now(),
+    Object.values(accountEvidence),
+    effectiveFees.blocks
+  );
+  const routes = toRouteEvidence(routeRows);
+  const valuationPriceToman = deriveValuationPrice(snapshots);
+  const observedWindowMs = observation?.elapsedMs ?? 0;
+
+  return {
+    readiness,
+    venueStates: classifyAllVenues(readiness),
+    routes,
+    valuationPriceToman,
+    observation: observation
+      ? {
+          status: observation.status,
+          successCoveragePercent: observation.successCoveragePercent,
+          elapsedMs: observation.elapsedMs,
+          targetDurationMs: observation.targetDurationMs
+        }
+      : null,
+    observationId: observation?.id ?? null,
+    observedWindowMs,
+    savedPlan,
+    history,
+    approval: approvalRow
+      ? ({
+          approvedBy: approvalRow.approvedBy,
+          approvedAt: approvalRow.approvedAt,
+          readinessFingerprint: approvalRow.readinessFingerprint,
+          planFingerprint: approvalRow.planFingerprint
+        } satisfies ApprovalRecord)
+      : null,
+    approvalRow
+  };
+}
+
+type Ctx = Awaited<ReturnType<typeof buildContext>>;
+
+function runSimulation(ctx: Ctx, plan: CapitalPlanInput) {
+  const simulation = simulateCapitalPlan({
+    plan,
+    readiness: ctx.readiness,
+    routes: ctx.routes,
+    observation: ctx.observation,
+    observedWindowMs: ctx.observedWindowMs,
+    // No confirmed transfer cost exists yet, so the monthly figure stays UNKNOWN.
+    perTransferCostToman: null,
+    perTransferCostConfirmed: false,
+    approval: ctx.approval
+  });
+  return {
+    simulation,
+    smallestFundableSizeUsdt: smallestFundableSizeUsdt(simulation.venues, plan.valuationPriceToman)
+  };
+}
+
+function envelope(ctx: Ctx, extra: Record<string, unknown>) {
+  return {
+    banner: SHADOW_BANNER,
+    shadowMode: true,
+    paperExecution: false,
+    serverNow: new Date().toISOString(),
+    defaults: {
+      capitalToman: DEFAULT_CAPITAL_TOMAN,
+      minCapitalToman: MIN_CAPITAL_TOMAN,
+      maxCapitalToman: MAX_CAPITAL_TOMAN
+    },
+    observationId: ctx.observationId,
+    valuationPriceToman: ctx.valuationPriceToman,
+    venues: ctx.venueStates,
+    ...extra
+  };
+}
+
+/** Current plan (or a provisional optimized proposal) plus its simulation. */
+export async function GET() {
+  const session = await requireAdminSession();
+  if (!isSession(session)) return session;
+
+  const ctx = await buildContext();
+
+  if (ctx.valuationPriceToman === null) {
+    return new NextResponse(
+      JSON.stringify(
+        envelope(ctx, {
+          plan: null,
+          simulation: null,
+          history: ctx.history,
+          unavailableReason:
+            "قیمت ارزش‌گذاری تتر از آخرین چرخهٔ جمع‌آوری قابل استخراج نیست؛ تا زمان وجود دادهٔ تازه، شبیه‌سازی انجام نمی‌شود."
+        })
+      ),
+      { status: 200, headers: SHADOW_NO_STORE }
+    );
+  }
+
+  const plan: CapitalPlanInput = ctx.savedPlan
+    ? {
+        totalCapitalToman: ctx.savedPlan.totalCapitalToman,
+        valuationPriceToman: ctx.valuationPriceToman,
+        allocations: ctx.savedPlan.allocations.filter((a) => VALID_IDS.has(a.sourceId)) as CapitalAllocation[],
+        mode: ctx.savedPlan.mode
+      }
+    : buildOptimizedPlan({
+        totalCapitalToman: DEFAULT_CAPITAL_TOMAN,
+        valuationPriceToman: ctx.valuationPriceToman,
+        readiness: ctx.readiness,
+        routes: ctx.routes
+      }).plan;
+
+  const result = runSimulation(ctx, plan);
+  return new NextResponse(
+    JSON.stringify(
+      envelope(ctx, {
+        plan,
+        planSource: ctx.savedPlan ? "SAVED" : "PROVISIONAL_OPTIMIZED",
+        savedPlanId: ctx.savedPlan?.id ?? null,
+        history: ctx.history,
+        ...result
+      })
+    ),
+    { status: 200, headers: SHADOW_NO_STORE }
+  );
+}
+
+/**
+ * Actions: `simulate` (stateless), `optimize` (propose a provisional split),
+ * `save` (append the plan). None of them can trade.
+ */
+export async function POST(request: Request) {
+  const session = await requireAdminSession();
+  if (!isSession(session)) return session;
+
+  let body: Record<string, unknown>;
+  try {
+    body = (await request.json()) as Record<string, unknown>;
+  } catch {
+    return bad("بدنهٔ JSON نامعتبر");
+  }
+
+  if (FORBIDDEN_FIELDS.some((k) => k in body)) {
+    return bad(
+      "شبیه‌ساز سرمایه هیچ کلید API یا اطلاعات محرمانه‌ای نمی‌پذیرد.",
+      "forbidden_field"
+    );
+  }
+
+  const action = String(body.action ?? "simulate");
+  if (!["simulate", "optimize", "save", "approve", "copy_from_session"].includes(action)) {
+    return bad("عملیات نامعتبر است");
+  }
+
+  const ctx = await buildContext();
+
+  /*
+   * Copy a plan from a paper session that already exists.
+   *
+   * Every number comes from the stored session — the nine allocations, the
+   * total, and the valuation price the session was struck at. The client sends
+   * one thing, a session id, and cannot influence any figure. That matters:
+   * ordinary `save` marks a plan at the LIVE price, which is right for a plan
+   * an admin is composing now, but wrong for a copy — the same allocations
+   * valued at a price that has since moved no longer conserve the total, and
+   * the plan would be refused for an over-allocation that is really just a
+   * change in the market.
+   *
+   * Append-only. Nothing existing is read for writing, and no session is
+   * created, started, paused, replaced or approved.
+   */
+  if (action === "copy_from_session") {
+    const paperSessionId = String(body.paperSessionId ?? "");
+    if (!paperSessionId) return bad("شناسهٔ نشست کاغذی لازم است");
+
+    const source = await getPaperSession(paperSessionId);
+    if (!source) return bad("نشست کاغذی با این شناسه یافت نشد", "not_found", 404);
+
+    const allocations = (source.openingAllocations ?? []).map((a) => ({
+      sourceId: a.sourceId as ShadowSourceId,
+      irtToman: a.irtToman,
+      usdtUnits: a.usdtUnits
+    }));
+    if (!allocations.length) {
+      return bad("این نشست هیچ تخصیص افتتاحیه‌ای ندارد؛ چیزی برای رونوشت نیست.");
+    }
+
+    const copied: CapitalPlanInput = {
+      totalCapitalToman: source.totalCapitalToman,
+      valuationPriceToman: source.valuationPriceToman,
+      allocations,
+      mode: "MANUAL"
+    };
+
+    /*
+     * Simulated against the SESSION's own price, so conservation is judged the
+     * way the session itself was judged. A copy that does not conserve is a
+     * copy of something broken, and is refused rather than stored.
+     */
+    const copyCtx = { ...ctx, valuationPriceToman: source.valuationPriceToman };
+    const copyResult = runSimulation(copyCtx, copied);
+    if (!copyResult.simulation.ok) {
+      return new NextResponse(
+        JSON.stringify({
+          error: "invalid_plan",
+          message: "تخصیص‌های این نشست در قیمت خودش پایستگی ندارند و ذخیره نشد.",
+          violations: copyResult.simulation.violations
+        }),
+        { status: 400, headers: SHADOW_NO_STORE }
+      );
+    }
+
+    try {
+      const saved = await saveCapitalPlan({
+        name: typeof body.name === "string" && body.name.trim()
+          ? body.name.trim().slice(0, 120)
+          : `رونوشت تخصیص از نشست ${source.name}`,
+        mode: "MANUAL",
+        totalCapitalToman: copied.totalCapitalToman,
+        valuationPriceToman: copied.valuationPriceToman,
+        reservePercent: 0,
+        allocations: copied.allocations,
+        createdBy: session.u ?? "admin",
+        note:
+          `رونوشت دقیق ${allocations.length} تخصیص افتتاحیهٔ نشست ${source.id} ` +
+          `با همان قیمت ارزش‌گذاری ${source.valuationPriceToman}. هیچ مقداری گرد، بازتوزین یا بهینه نشده است.`
+      });
+      const after = await buildContext();
+      return new NextResponse(
+        JSON.stringify(
+          envelope(after, {
+            plan: copied,
+            planSource: "SAVED",
+            savedPlanId: saved.id,
+            copiedFromSessionId: source.id,
+            history: after.history,
+            ...copyResult
+          })
+        ),
+        { status: 200, headers: SHADOW_NO_STORE }
+      );
+    } catch (error) {
+      return new NextResponse(
+        JSON.stringify({
+          error: "unavailable",
+          message: error instanceof Error ? error.message : "ذخیرهٔ رونوشت ممکن نشد"
+        }),
+        { status: 503, headers: SHADOW_NO_STORE }
+      );
+    }
+  }
+
+  if (ctx.valuationPriceToman === null) {
+    return bad(
+      "قیمت ارزش‌گذاری تتر در دسترس نیست؛ شبیه‌سازی بدون آن انجام نمی‌شود.",
+      "unavailable",
+      503
+    );
+  }
+
+  const totalCapitalToman = Number(body.totalCapitalToman ?? DEFAULT_CAPITAL_TOMAN);
+  if (
+    !Number.isFinite(totalCapitalToman) ||
+    totalCapitalToman < MIN_CAPITAL_TOMAN ||
+    totalCapitalToman > MAX_CAPITAL_TOMAN
+  ) {
+    return bad("سرمایهٔ واردشده خارج از بازهٔ مجاز است");
+  }
+
+  if (action === "optimize") {
+    const reservePercent = Number(body.reservePercent ?? 0);
+    if (!Number.isFinite(reservePercent) || reservePercent < 0 || reservePercent > 90) {
+      return bad("درصد ذخیره باید بین ۰ تا ۹۰ باشد");
+    }
+    const optimized = buildOptimizedPlan({
+      totalCapitalToman,
+      valuationPriceToman: ctx.valuationPriceToman,
+      readiness: ctx.readiness,
+      routes: ctx.routes,
+      reservePercent
+    });
+    const result = runSimulation(ctx, optimized.plan);
+    return new NextResponse(
+      JSON.stringify(
+        envelope(ctx, {
+          plan: optimized.plan,
+          planSource: "PROVISIONAL_OPTIMIZED",
+          optimization: {
+            basis: optimized.basis,
+            basisFa: optimized.basisFa,
+            status: optimized.status,
+            reasonFa: optimized.reasonFa,
+            venueWeights: optimized.venueWeights
+          },
+          history: ctx.history,
+          ...result
+        })
+      ),
+      { status: 200, headers: SHADOW_NO_STORE }
+    );
+  }
+
+  const parsed = parseAllocations(body.allocations ?? []);
+  if (!parsed.ok) return bad(parsed.message);
+
+  const plan: CapitalPlanInput = {
+    totalCapitalToman,
+    valuationPriceToman: ctx.valuationPriceToman,
+    allocations: parsed.value,
+    mode: body.mode === "OPTIMIZED" ? "OPTIMIZED" : "MANUAL"
+  };
+  const result = runSimulation(ctx, plan);
+
+  if (action === "simulate") {
+    return new NextResponse(
+      JSON.stringify(envelope(ctx, { plan, planSource: "DRAFT", history: ctx.history, ...result })),
+      { status: 200, headers: SHADOW_NO_STORE }
+    );
+  }
+
+  if (action === "approve") {
+    // An admin decision about a SIMULATION. It writes one audit row and does
+    // nothing else — no order, no transfer, no exchange call.
+    if (!result.simulation.ok) {
+      return new NextResponse(
+        JSON.stringify({
+          error: "invalid_plan",
+          message: "طرح تخصیص معتبر نیست و تأیید نشد.",
+          violations: result.simulation.violations
+        }),
+        { status: 400, headers: SHADOW_NO_STORE }
+      );
+    }
+    const rec = result.simulation.recommendation;
+    if (!rec.eligibleForApproval) {
+      return new NextResponse(
+        JSON.stringify({
+          error: "not_eligible",
+          message: `این طرح هنوز آمادهٔ تأیید نیست. ${rec.reasonFa}`,
+          recommendation: rec
+        }),
+        { status: 409, headers: SHADOW_NO_STORE }
+      );
+    }
+    try {
+      await saveCapitalApproval({
+        planId: ctx.savedPlan?.id ?? null,
+        planFingerprint: planFingerprint(plan),
+        readinessFingerprint: readinessFingerprint(ctx.venueStates),
+        approvedBy: session.u ?? "admin",
+        note: typeof body.note === "string" ? body.note.slice(0, 500) : null
+      });
+    } catch (error) {
+      return new NextResponse(
+        JSON.stringify({
+          error: "unavailable",
+          message: error instanceof Error ? error.message : "ثبت تأیید ممکن نشد"
+        }),
+        { status: 503, headers: SHADOW_NO_STORE }
+      );
+    }
+    // Re-read so the response reflects the stored approval, not an assumption.
+    const after = await buildContext();
+    const rerun = runSimulation(after, plan);
+    return new NextResponse(
+      JSON.stringify(
+        envelope(after, { plan, planSource: "APPROVED", history: after.history, ...rerun })
+      ),
+      { status: 200, headers: SHADOW_NO_STORE }
+    );
+  }
+
+  // save — refuse to persist a plan that violates conservation or balances.
+  if (!result.simulation.ok) {
+    return new NextResponse(
+      JSON.stringify({
+        error: "invalid_plan",
+        message: "طرح تخصیص معتبر نیست و ذخیره نشد.",
+        violations: result.simulation.violations
+      }),
+      { status: 400, headers: SHADOW_NO_STORE }
+    );
+  }
+
+  try {
+    const saved = await saveCapitalPlan({
+      name: typeof body.name === "string" && body.name.trim() ? body.name.trim().slice(0, 80) : "طرح تخصیص سرمایه",
+      mode: plan.mode,
+      totalCapitalToman: plan.totalCapitalToman,
+      valuationPriceToman: plan.valuationPriceToman,
+      reservePercent: 0,
+      allocations: plan.allocations,
+      createdBy: session.u ?? "admin",
+      note: typeof body.note === "string" ? body.note.slice(0, 500) : null
+    });
+    const history = await loadCapitalPlans(25);
+    return new NextResponse(
+      JSON.stringify(
+        envelope(ctx, { plan, planSource: "SAVED", savedPlanId: saved.id, history, ...result })
+      ),
+      { status: 200, headers: SHADOW_NO_STORE }
+    );
+  } catch (error) {
+    return new NextResponse(
+      JSON.stringify({
+        error: "unavailable",
+        message: error instanceof Error ? error.message : "ذخیرهٔ طرح ممکن نشد"
+      }),
+      { status: 503, headers: SHADOW_NO_STORE }
+    );
+  }
+}

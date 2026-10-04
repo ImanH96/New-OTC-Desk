@@ -1,0 +1,308 @@
+import { createHash } from "node:crypto";
+import { buildPreviousMonthSection, recordCompletedForexEvents } from "@/lib/forexHistory";
+import { fetchJson } from "@/lib/http";
+import type { DeskSettings, ForexEvent, ForexEventsResponse, ForexImpact, PremiumImpact } from "@/lib/types";
+
+// Forex Factory public weekly calendar mirror (faireconomy.media). Real source, no API key required.
+const THIS_WEEK = "https://nfs.faireconomy.media/ff_calendar_thisweek.json";
+const NEXT_WEEK = "https://nfs.faireconomy.media/ff_calendar_nextweek.json";
+
+type RawEvent = {
+  title?: string;
+  country?: string;
+  date?: string;
+  impact?: string;
+  forecast?: string;
+  previous?: string;
+  actual?: string;
+  link?: string;
+  url?: string;
+};
+
+// Only the high-impact event types the desk cares about.
+const categoryMatchers: Array<{ category: string; pattern: RegExp }> = [
+  { category: "FOMC", pattern: /\bfomc\b|federal funds rate|fomc statement|fed (?:chair|press|interest rate)|rate decision/i },
+  { category: "Fed Speaks", pattern: /\bpowell\b|fed chair|federal reserve/i },
+  { category: "NFP", pattern: /non[\s-]?farm(?: employment| payrolls?)?|\bnfp\b/i },
+  { category: "Core PCE", pattern: /core pce|pce price index/i },
+  { category: "CPI", pattern: /\bcpi\b|consumer price index/i },
+  { category: "PPI", pattern: /\bppi\b|producer price index/i },
+  { category: "GDP", pattern: /\bgdp\b|gross domestic product/i },
+  { category: "Unemployment Rate", pattern: /unemployment rate/i },
+  { category: "Jobless Claims", pattern: /jobless claims|initial claims|unemployment claims/i },
+  { category: "Retail Sales", pattern: /retail sales/i },
+  { category: "ISM", pattern: /\bism\b/i },
+  { category: "PMI", pattern: /\bpmi\b|purchasing managers/i }
+];
+
+function matchCategory(title: string): string | null {
+  return categoryMatchers.find((matcher) => matcher.pattern.test(title))?.category ?? null;
+}
+
+function normalizeImpact(value: string | undefined): ForexImpact {
+  const lowered = (value ?? "").toLowerCase();
+  if (lowered.includes("high")) return "high";
+  if (lowered.includes("medium")) return "medium";
+  if (lowered.includes("holiday")) return "holiday";
+  return "low";
+}
+
+function clean(value: string | undefined): string | null {
+  const trimmed = (value ?? "").trim();
+  return trimmed.length ? trimmed : null;
+}
+
+function parseNumeric(value: string | null): number | null {
+  if (!value) return null;
+  const match = value.replace(/,/g, "").match(/-?\d+(?:\.\d+)?/);
+  return match ? Number(match[0]) : null;
+}
+
+// Categories where a HIGHER reading signals a WEAKER economy / softer USD (inverse direction).
+const inverseCategories = new Set(["Unemployment Rate", "Jobless Claims"]);
+
+// Likely effect of a USD macro release on the USDT/IRT premium.
+// Hotter US data → stronger USD + risk-off → more demand for dollar-proxy in Iran → premium up.
+// Softer data → the opposite → premium eases. Before release (no actual) we stay neutral (no guessing).
+function premiumImpactFor(
+  category: string,
+  forecast: string | null,
+  actual: string | null
+): { impact: PremiumImpact; reason: string | null } {
+  const a = parseNumeric(actual);
+  const f = parseNumeric(forecast);
+  if (a !== null && f !== null) {
+    const tolerance = Math.max(Math.abs(f) * 0.001, 0.01);
+    if (Math.abs(a - f) <= tolerance) {
+      return { impact: "neutral", reason: "داده تقریباً مطابق پیش‌بینی" };
+    }
+    const inverse = inverseCategories.has(category);
+    const strongerUsd = inverse ? a < f : a > f;
+    return strongerUsd
+      ? { impact: "up", reason: "داده داغ‌تر از پیش‌بینی (دلار قوی‌تر)" }
+      : { impact: "down", reason: "داده ضعیف‌تر از پیش‌بینی (دلار ضعیف‌تر)" };
+  }
+  return { impact: "neutral", reason: "در انتظار انتشار؛ احتمال نوسان" };
+}
+
+function getActualComparison(category: string, forecast: string | null, actual: string | null): string | null {
+  const f = parseNumeric(forecast);
+  const a = parseNumeric(actual);
+  if (f === null || a === null) return null;
+  const tolerance = Math.max(Math.abs(f) * 0.005, 0.05);
+  if (Math.abs(a - f) <= tolerance) {
+    return "مطابق پیش‌بینی";
+  }
+  const inverse = inverseCategories.has(category);
+  const isBetter = inverse ? a < f : a > f;
+  return isBetter ? "بهتر از پیش‌بینی" : "بدتر از پیش‌بینی";
+}
+
+function idFor(value: string) {
+  return createHash("sha1").update(value).digest("hex").slice(0, 12);
+}
+
+function toEvent(raw: RawEvent): ForexEvent | null {
+  const title = (raw.title ?? "").trim();
+  if (!title) return null;
+  // Desk only cares about US Dollar events; ignore every other currency (EUR, CAD, …).
+  if ((raw.country ?? "").trim().toUpperCase() !== "USD") return null;
+  const category = matchCategory(title);
+  if (!category) return null;
+  const date = raw.date ? new Date(raw.date) : null;
+  const iso = date && !Number.isNaN(date.getTime()) ? date.toISOString() : null;
+  const forecast = clean(raw.forecast);
+  const actual = clean(raw.actual);
+  const premium = premiumImpactFor(category, forecast, actual);
+  return {
+    id: idFor(`${title}:${raw.country ?? ""}:${raw.date ?? ""}`),
+    title,
+    category,
+    country: clean(raw.country) ?? "—",
+    date: iso,
+    impact: normalizeImpact(raw.impact),
+    previous: clean(raw.previous),
+    forecast,
+    actual,
+    premiumImpact: premium.impact,
+    premiumImpactReason: premium.reason,
+    actualComparison: getActualComparison(category, forecast, actual),
+    link: clean(raw.link || raw.url)
+  };
+}
+
+// A browser-like UA reduces the chance of the CDN rate-limiting/refusing the request.
+const BROWSER_UA =
+  "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0 Safari/537.36";
+
+async function fetchWeek(url: string): Promise<ForexEvent[]> {
+  const data = await fetchJson<RawEvent[]>(url, 12_000, { headers: { "user-agent": BROWSER_UA } });
+  if (!Array.isArray(data)) return [];
+  return data.map(toEvent).filter((event): event is ForexEvent => event !== null);
+}
+
+const delay = (ms: number) => new Promise((resolve) => setTimeout(resolve, ms));
+
+// Forex Factory rate-limits aggressive polling, and the calendar only changes weekly,
+// so cache successful responses (in memory AND on disk) and fall back to the last good
+// result on transient errors (e.g. HTTP 429). Durable last-good lives in PostgreSQL.
+const FRESH_TTL_MS = 60 * 1000; // 1 min normal
+const STALE_TTL_MS = 24 * 60 * 60_000; // 24 h: serve last good data when the source fails
+const HOT_TTL_MS = 20 * 1000; // 20s around release times
+const FOREX_CACHE_KV = "forex_calendar_cache";
+
+type CacheEntry = { at: number; data: ForexEventsResponse };
+
+let memCache: CacheEntry | null = null;
+let inflight: Promise<ForexEventsResponse> | null = null;
+
+async function readDiskCache(): Promise<CacheEntry | null> {
+  try {
+    const { pgGetKv } = await import("@/db/repositories/kv");
+    const parsed = await pgGetKv<CacheEntry>(FOREX_CACHE_KV);
+    return parsed && typeof parsed.at === "number" && parsed.data ? parsed : null;
+  } catch {
+    return null;
+  }
+}
+
+async function writeDiskCache(entry: CacheEntry): Promise<void> {
+  try {
+    const { pgSetKv } = await import("@/db/repositories/kv");
+    await pgSetKv(FOREX_CACHE_KV, entry, "forex-cache");
+  } catch {
+    // cache is best-effort
+  }
+}
+
+async function getCachedEntry(): Promise<CacheEntry | null> {
+  if (memCache) return memCache;
+  memCache = await readDiskCache();
+  return memCache;
+}
+
+async function fetchFresh(): Promise<ForexEventsResponse> {
+  // Sequential (not a parallel burst) with a short gap, to stay under the source rate limit.
+  const thisWeek = await Promise.allSettled([fetchWeek(THIS_WEEK)]);
+  await delay(400);
+  const nextWeek = await Promise.allSettled([fetchWeek(NEXT_WEEK)]);
+  const results = [...thisWeek, ...nextWeek];
+  const collected = results.flatMap((result) => (result.status === "fulfilled" ? result.value : []));
+  const allFailed = results.every((result) => result.status === "rejected");
+
+  if (!collected.length) {
+    const firstError =
+      results.find((result): result is PromiseRejectedResult => result.status === "rejected")?.reason ?? null;
+    return {
+      events: [],
+      sourceStatus: allFailed ? "unavailable" : "degraded",
+      lastUpdated: allFailed ? null : new Date().toISOString(),
+      message: allFailed
+        ? firstError instanceof Error
+          ? firstError.message
+          : "منبع در دسترس نیست"
+        : "داده‌ای دریافت نشد"
+    };
+  }
+
+  // Keep High and Medium impact only, de-duplicate, sort by time ascending.
+  const unique = Array.from(new Map(collected.map((event) => [event.id, event])).values())
+    .filter((event) => event.impact === "high" || event.impact === "medium")
+    .sort((a, b) => new Date(a.date ?? 0).getTime() - new Date(b.date ?? 0).getTime());
+
+  return {
+    events: unique,
+    sourceStatus: allFailed ? "degraded" : "available",
+    lastUpdated: new Date().toISOString()
+  };
+}
+
+async function withPreviousMonth(data: ForexEventsResponse): Promise<ForexEventsResponse> {
+  // Persist completed events on every response path; then attach previous-month panel data.
+  void recordCompletedForexEvents(data.events).catch(() => {});
+  try {
+    const previousMonth = await buildPreviousMonthSection(data.events, data.sourceStatus, data.lastUpdated);
+    return { ...data, previousMonth };
+  } catch {
+    return data;
+  }
+}
+
+function kickBackgroundForexRefresh(): void {
+  if (inflight) return;
+  inflight = (async () => {
+    try {
+      const fresh = await fetchFresh();
+      if (fresh.events.length) {
+        const entry: CacheEntry = { at: Date.now(), data: fresh };
+        memCache = entry;
+        await writeDiskCache(entry);
+        return withPreviousMonth(fresh);
+      }
+      const fallback = await getCachedEntry();
+      if (fallback && fallback.data.events.length && Date.now() - fallback.at < STALE_TTL_MS) {
+        return withPreviousMonth({
+          ...fallback.data,
+          sourceStatus: "degraded",
+          message: `آخرین داده معتبر نمایش داده شد (به‌روزرسانی موقتاً ناموفق${
+            fresh.message ? `: ${fresh.message}` : ""
+          })`
+        });
+      }
+      return withPreviousMonth(fresh);
+    } finally {
+      inflight = null;
+    }
+  })();
+}
+
+export async function getForexEvents(settings: DeskSettings): Promise<ForexEventsResponse> {
+  if (settings.enabledSources.forex === false) {
+    const empty: ForexEventsResponse = {
+      events: [],
+      sourceStatus: "unavailable",
+      lastUpdated: null,
+      message: "منبع تقویم فارکس در تنظیمات غیرفعال است"
+    };
+    return withPreviousMonth(empty);
+  }
+
+  const cached = await getCachedEntry();
+  if (cached && cached.data.events.length) {
+    const now = Date.now();
+    const hasNearRelease = cached.data.events.some((ev) => {
+      if (!ev.date) return false;
+      const t = new Date(ev.date).getTime();
+      if (!Number.isFinite(t)) return false;
+      return Math.abs(t - now) < 15 * 60 * 1000; // within ~15min of release
+    });
+    const effectiveTtl = hasNearRelease ? HOT_TTL_MS : FRESH_TTL_MS;
+    const age = now - cached.at;
+
+    if (age < effectiveTtl) {
+      return withPreviousMonth(cached.data);
+    }
+
+    // Stale-while-revalidate: never block the UI on upstream calendar (often >10s)
+    if (age < STALE_TTL_MS) {
+      kickBackgroundForexRefresh();
+      return withPreviousMonth({
+        ...cached.data,
+        sourceStatus: cached.data.sourceStatus === "unavailable" ? "degraded" : cached.data.sourceStatus
+      });
+    }
+  }
+
+  // Cold start (no cache) — wait once, shared inflight
+  if (!inflight) {
+    kickBackgroundForexRefresh();
+  }
+  if (inflight) return inflight;
+
+  return withPreviousMonth({
+    events: [],
+    sourceStatus: "unavailable",
+    lastUpdated: null,
+    message: "منبع در دسترس نیست"
+  });
+}

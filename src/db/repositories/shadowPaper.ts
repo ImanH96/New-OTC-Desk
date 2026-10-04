@@ -1,0 +1,1653 @@
+/**
+ * Phase 6 persistence — paper sessions, virtual balances and the immutable
+ * ledger.
+ *
+ * Simulated state only. Nothing in this file represents a real exchange
+ * account, order, deposit, withdrawal or transfer.
+ *
+ * Conventions inherited from the Phase 2 repository: uuid ids are generated
+ * in-process with randomUUID() (the migration runner strips database-side
+ * defaults for PGlite), and every statement runs inside the shared
+ * serialization wrapper.
+ */
+import { randomUUID } from "node:crypto";
+import { and, desc, eq, inArray, isNull, sql } from "drizzle-orm";
+import { asDbError, getDbAsync } from "@/db/client";
+import { runSerialized } from "@/db/repositories/shadowArbitrage";
+import {
+  auditLogs,
+  shadowCapitalPlans,
+  shadowPaperBalances,
+  shadowPaperCandidateState,
+  shadowPaperCycleSummaries,
+  shadowPaperLedger,
+  shadowPaperLegRiskClosures,
+  shadowPaperSessions
+} from "@/db/schema";
+
+export type PaperSessionMode = "PROVISIONAL_EVALUATION" | "APPROVED_PLAN";
+export type PaperSessionStatus = "NOT_STARTED" | "RUNNING" | "PAUSED" | "STOPPED";
+
+/** Machine-readable resume conflict when LEG_RISK exposure remains open. */
+export class UnresolvedLegRiskError extends Error {
+  readonly code = "unresolved_leg_risk" as const;
+  readonly sessionId: string;
+  readonly ledgerId: string;
+  readonly lifecycleId: string;
+  readonly rejectionCode: string | null;
+
+  constructor(input: {
+    sessionId: string;
+    ledgerId: string;
+    lifecycleId: string;
+    rejectionCode?: string | null;
+  }) {
+    super(
+      `Paper session has unresolved leg exposure; resume is blocked (ledger=${input.ledgerId}, lifecycle=${input.lifecycleId})`
+    );
+    this.name = "UnresolvedLegRiskError";
+    this.sessionId = input.sessionId;
+    this.ledgerId = input.ledgerId;
+    this.lifecycleId = input.lifecycleId;
+    this.rejectionCode = input.rejectionCode ?? null;
+  }
+}
+
+export function isUnresolvedLegRiskError(error: unknown): error is UnresolvedLegRiskError {
+  return error instanceof UnresolvedLegRiskError;
+}
+
+export type PaperSessionRow = {
+  id: string;
+  observationId: string | null;
+  name: string;
+  mode: PaperSessionMode;
+  status: PaperSessionStatus;
+  totalCapitalToman: number;
+  valuationPriceToman: number;
+  openingAllocations: Array<{ sourceId: string; irtToman: number; usdtUnits: number }>;
+  approvalFingerprint: string | null;
+  createdBy: string;
+  startedAt: string | null;
+  pausedAt: string | null;
+  stoppedAt: string | null;
+  lastCycleAt: string | null;
+  cyclesEvaluated: number;
+  tradesExecuted: number;
+  candidatesSkipped: number;
+  note: string | null;
+  experimentRunId: string | null;
+  createdAt: string;
+};
+
+export type PaperBalanceRow = {
+  sourceId: string;
+  irtToman: number;
+  usdtMicros: number;
+};
+
+export type PaperLedgerRow = {
+  id: string;
+  eventType: string | null;
+  reasonCodes: string[];
+  sessionId: string;
+  runId: string | null;
+  lifecycleId: string;
+  routeKey: string;
+  outcome: "FILLED" | "SKIPPED" | "LEG_RISK";
+  rejectionCode: string | null;
+  rejectionReason: string | null;
+  requiredRebalance: string | null;
+  buySourceId: string;
+  sellSourceId: string;
+  sizeUsdt: number;
+  buyVwapToman: number | null;
+  sellVwapToman: number | null;
+  buyNotionalToman: number | null;
+  sellNotionalToman: number | null;
+  buyFeeBps: number | null;
+  sellFeeBps: number | null;
+  buyFeeAsset: string | null;
+  buyFeeDebitMode: string | null;
+  buyFeeProvenance: string | null;
+  sellFeeAsset: string | null;
+  sellFeeDebitMode: string | null;
+  sellFeeProvenance: string | null;
+  feeTomanTotal: number | null;
+  feeUsdtMicrosTotal: number | null;
+  slippageBufferToman: number | null;
+  grossSpreadToman: number | null;
+  markPriceToman: number | null;
+  cashPnlIrtToman: number | null;
+  inventoryDeltaUsdtMicros: number | null;
+  sellFeeValueToman: number | null;
+  economicNetPnlToman: number | null;
+  riskAdjustedPnlToman: number | null;
+  balancesAfter: Array<{ sourceId: string; irtToman: number; usdtMicros: number }>;
+  /**
+   * SMART_CAPITAL_DEPTH decision evidence, from migration 0015. Null on any row
+   * written before smart sizing — a null means "not recorded", never a value
+   * invented to fill the gap.
+   */
+  sizingPolicy: string | null;
+  sizingReason: string | null;
+  limitingSide: string | null;
+  limitingSourceId: string | null;
+  limitingUsableUsdtMicros: number | null;
+  capitalCapUsdtMicros: number | null;
+  depthCapUsdtMicros: number | null;
+  bindingConstraint: string | null;
+  riskAdjustedReturnBps: number | null;
+  selectedPercentOfUsable: number | null;
+  inventoryImpactPoints: number | null;
+  nextLargerSizeUsdt: number | null;
+  nextLargerRejectionCode: string | null;
+  nextLargerRejectionReason: string | null;
+  nextLargerMarginalPnlToman: number | null;
+  /** Complete final sizing audit when recorded (migration 0018). */
+  sizingAudit: Record<string, unknown> | null;
+  experimentRunId: string | null;
+  occurredAt: string;
+};
+
+function num(v: string | number | null | undefined): number {
+  if (v === null || v === undefined) return 0;
+  const n = typeof v === "number" ? v : Number(v);
+  return Number.isFinite(n) ? n : 0;
+}
+
+function numOrNull(v: string | number | null | undefined): number | null {
+  if (v === null || v === undefined) return null;
+  const n = typeof v === "number" ? v : Number(v);
+  return Number.isFinite(n) ? n : null;
+}
+
+/**
+ * PGlite is a single WASM instance, so every statement must be serialized.
+ * This shares the Phase 2 repository's reentrancy context on purpose: the paper
+ * engine runs inside a collection cycle, and on PGlite that cycle already holds
+ * the serialization queue. A private queue wrapper here would deadlock.
+ */
+const serial = runSerialized;
+
+/**
+ * Whether an error is a unique-constraint violation.
+ *
+ * Drivers wrap the original error, and the wrapper's message is only "Failed
+ * query: ...", so the SQLSTATE has to be read from the cause chain rather than
+ * pattern-matched on the top-level message.
+ */
+function isUniqueViolation(error: unknown): boolean {
+  const seen = new Set<unknown>();
+  let cur: unknown = error;
+  while (cur && typeof cur === "object" && !seen.has(cur)) {
+    seen.add(cur);
+    const rec = cur as { code?: unknown; constraint?: unknown; message?: unknown; cause?: unknown };
+    if (rec.code === "23505") return true;
+    if (typeof rec.constraint === "string" && rec.constraint.includes("idem")) return true;
+    if (
+      typeof rec.message === "string" &&
+      /duplicate key|unique constraint|UNIQUE constraint/i.test(rec.message)
+    ) {
+      return true;
+    }
+    cur = rec.cause;
+  }
+  return false;
+}
+
+function toSession(r: typeof shadowPaperSessions.$inferSelect): PaperSessionRow {
+  return {
+    id: r.id,
+    observationId: r.observationId,
+    name: r.name,
+    mode: r.mode === "APPROVED_PLAN" ? "APPROVED_PLAN" : "PROVISIONAL_EVALUATION",
+    status: (["NOT_STARTED", "RUNNING", "PAUSED", "STOPPED"] as const).includes(
+      r.status as PaperSessionStatus
+    )
+      ? (r.status as PaperSessionStatus)
+      : "NOT_STARTED",
+    totalCapitalToman: num(r.totalCapitalToman),
+    valuationPriceToman: num(r.valuationPriceToman),
+    openingAllocations: Array.isArray(r.openingAllocations) ? r.openingAllocations : [],
+    approvalFingerprint: r.approvalFingerprint,
+    createdBy: r.createdBy,
+    startedAt: r.startedAt,
+    pausedAt: r.pausedAt,
+    stoppedAt: r.stoppedAt,
+    lastCycleAt: r.lastCycleAt,
+    cyclesEvaluated: r.cyclesEvaluated,
+    tradesExecuted: r.tradesExecuted,
+    candidatesSkipped: r.candidatesSkipped,
+    note: r.note,
+    experimentRunId: r.experimentRunId ?? null,
+    createdAt: r.createdAt
+  };
+}
+
+/**
+ * The session the engine should act on: the newest one that is not stopped.
+ * Returns null when no session exists — which is the state after a fresh
+ * deployment, and why deployment never starts paper trading on its own.
+ */
+export async function getActivePaperSession(): Promise<PaperSessionRow | null> {
+  try {
+    const db = await getDbAsync();
+    const rows = await serial(async () =>
+      db
+        .select()
+        .from(shadowPaperSessions)
+        .where(inArray(shadowPaperSessions.status, ["NOT_STARTED", "RUNNING", "PAUSED"]))
+        .orderBy(desc(shadowPaperSessions.createdAt))
+        .limit(1)
+    );
+    return rows[0] ? toSession(rows[0]) : null;
+  } catch {
+    return null;
+  }
+}
+
+export async function listPaperSessions(limit = 20): Promise<PaperSessionRow[]> {
+  try {
+    const db = await getDbAsync();
+    const rows = await serial(async () =>
+      db
+        .select()
+        .from(shadowPaperSessions)
+        .orderBy(desc(shadowPaperSessions.createdAt))
+        .limit(Math.min(100, Math.max(1, limit)))
+    );
+    return rows.map(toSession);
+  } catch {
+    return [];
+  }
+}
+
+export async function getPaperSession(id: string): Promise<PaperSessionRow | null> {
+  try {
+    const db = await getDbAsync();
+    const rows = await serial(async () =>
+      db.select().from(shadowPaperSessions).where(eq(shadowPaperSessions.id, id)).limit(1)
+    );
+    return rows[0] ? toSession(rows[0]) : null;
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * Create a session and its opening virtual book in one go.
+ * The session starts NOT_STARTED: an admin must start it explicitly.
+ */
+export async function createPaperSession(input: {
+  observationId: string | null;
+  name: string;
+  mode: PaperSessionMode;
+  totalCapitalToman: number;
+  valuationPriceToman: number;
+  openingAllocations: Array<{ sourceId: string; irtToman: number; usdtUnits: number }>;
+  approvalFingerprint: string | null;
+  createdBy: string;
+  note?: string | null;
+}): Promise<PaperSessionRow> {
+  try {
+    const db = await getDbAsync();
+    const now = new Date().toISOString();
+    const id = randomUUID();
+    const row = {
+      id,
+      observationId: input.observationId,
+      name: input.name,
+      mode: input.mode,
+      status: "NOT_STARTED" as const,
+      totalCapitalToman: Math.round(input.totalCapitalToman),
+      valuationPriceToman: Math.round(input.valuationPriceToman),
+      openingAllocations: input.openingAllocations,
+      approvalFingerprint: input.approvalFingerprint,
+      createdBy: input.createdBy,
+      startedAt: null,
+      pausedAt: null,
+      stoppedAt: null,
+      lastCycleAt: null,
+      cyclesEvaluated: 0,
+      tradesExecuted: 0,
+      candidatesSkipped: 0,
+      note: input.note ?? null,
+      createdAt: now,
+      updatedAt: now
+    };
+    await serial(async () => {
+      await db.insert(shadowPaperSessions).values(row);
+      for (const a of input.openingAllocations) {
+        await db.insert(shadowPaperBalances).values({
+          id: `${id}|${a.sourceId}`,
+          sessionId: id,
+          sourceId: a.sourceId,
+          irtToman: Math.max(0, Math.round(a.irtToman)),
+          usdtMicros: Math.max(0, Math.round(a.usdtUnits * 1_000_000)),
+          updatedAt: now
+        });
+      }
+    });
+    return toSession(row as typeof shadowPaperSessions.$inferSelect);
+  } catch (error) {
+    throw asDbError(error, "createPaperSession");
+  }
+}
+
+/** Lifecycle transitions. Only status and timestamps change; history is kept. */
+export async function setPaperSessionStatus(
+  id: string,
+  status: PaperSessionStatus
+): Promise<PaperSessionRow | null> {
+  try {
+    const db = await getDbAsync();
+    const now = new Date().toISOString();
+    const patch: Record<string, unknown> = { status, updatedAt: now };
+    if (status === "RUNNING") patch.pausedAt = null;
+    if (status === "PAUSED") patch.pausedAt = now;
+    if (status === "STOPPED") patch.stoppedAt = now;
+
+    await serial(async () => {
+      const existing = await db
+        .select({ startedAt: shadowPaperSessions.startedAt })
+        .from(shadowPaperSessions)
+        .where(eq(shadowPaperSessions.id, id))
+        .limit(1);
+      if (status === "RUNNING") {
+        const open = await listUnresolvedLegRiskRows(id);
+        if (open.length) {
+          const first = open[0]!;
+          throw new UnresolvedLegRiskError({
+            sessionId: id,
+            ledgerId: first.ledgerId,
+            lifecycleId: first.lifecycleId,
+            rejectionCode: first.rejectionCode
+          });
+        }
+      }
+      if (status === "RUNNING" && !existing[0]?.startedAt) patch.startedAt = now;
+      await db.update(shadowPaperSessions).set(patch).where(eq(shadowPaperSessions.id, id));
+    });
+    return getPaperSession(id);
+  } catch (error) {
+    if (isUnresolvedLegRiskError(error)) throw error;
+    throw asDbError(error, "setPaperSessionStatus");
+  }
+}
+
+/**
+ * Link a durable observation session to a paper session when observationId is null.
+ * Never invents/relabels experimentId as observationId. Idempotent if already set to same id.
+ */
+export async function linkPaperSessionObservation(
+  sessionId: string,
+  observationId: string
+): Promise<PaperSessionRow | null> {
+  try {
+    const db = await getDbAsync();
+    const now = new Date().toISOString();
+    await serial(async () => {
+      const rows = await db
+        .select({ observationId: shadowPaperSessions.observationId })
+        .from(shadowPaperSessions)
+        .where(eq(shadowPaperSessions.id, sessionId))
+        .limit(1);
+      const existing = rows[0];
+      if (!existing) return;
+      if (existing.observationId && existing.observationId !== observationId) {
+        throw new Error(
+          `linkPaperSessionObservation: session ${sessionId} already linked to ${existing.observationId}`
+        );
+      }
+      if (existing.observationId === observationId) return;
+      await db
+        .update(shadowPaperSessions)
+        .set({ observationId, updatedAt: now })
+        .where(eq(shadowPaperSessions.id, sessionId));
+    });
+    return getPaperSession(sessionId);
+  } catch (error) {
+    throw asDbError(error, "linkPaperSessionObservation");
+  }
+}
+
+export type UnresolvedLegRiskRow = {
+  ledgerId: string;
+  lifecycleId: string;
+  rejectionCode: string | null;
+  occurredAt: string;
+  inventoryDeltaUsdtMicros: number | null;
+};
+
+/** LEG_RISK ledger rows with no audited closure. */
+export async function listUnresolvedLegRiskRows(
+  sessionId: string
+): Promise<UnresolvedLegRiskRow[]> {
+  const db = await getDbAsync();
+  const risks = await serial(async () =>
+    db
+      .select({
+        ledgerId: shadowPaperLedger.id,
+        lifecycleId: shadowPaperLedger.lifecycleId,
+        rejectionCode: shadowPaperLedger.rejectionCode,
+        occurredAt: shadowPaperLedger.occurredAt,
+        inventoryDeltaUsdtMicros: shadowPaperLedger.inventoryDeltaUsdtMicros
+      })
+      .from(shadowPaperLedger)
+      .where(
+        and(eq(shadowPaperLedger.sessionId, sessionId), eq(shadowPaperLedger.outcome, "LEG_RISK"))
+      )
+      .orderBy(desc(shadowPaperLedger.occurredAt))
+  );
+  if (!risks.length) return [];
+  const closures = await serial(async () =>
+    db
+      .select({ ledgerId: shadowPaperLegRiskClosures.ledgerId })
+      .from(shadowPaperLegRiskClosures)
+      .where(eq(shadowPaperLegRiskClosures.sessionId, sessionId))
+  );
+  const closed = new Set(closures.map((c) => c.ledgerId));
+  return risks
+    .filter((r) => !closed.has(r.ledgerId))
+    .map((r) => ({
+      ledgerId: r.ledgerId,
+      lifecycleId: r.lifecycleId,
+      rejectionCode: r.rejectionCode,
+      occurredAt: r.occurredAt,
+      inventoryDeltaUsdtMicros: r.inventoryDeltaUsdtMicros
+    }));
+}
+
+export type LegRiskClosureRow = {
+  id: string;
+  sessionId: string;
+  ledgerId: string;
+  lifecycleId: string;
+  rejectionCode: string | null;
+  closedBy: string;
+  closedAt: string;
+  evidence: Record<string, unknown>;
+  note: string | null;
+  reused: boolean;
+};
+
+/**
+ * Explicit Paper-only reconciliation: mark LEG_RISK exposure closed with audit
+ * evidence. Does NOT delete the ledger row, invent fills/hedges, or mutate balances.
+ */
+export async function reconcilePaperLegRisk(input: {
+  sessionId: string;
+  ledgerId: string;
+  closedBy: string;
+  evidence: Record<string, unknown>;
+  note?: string | null;
+}): Promise<LegRiskClosureRow> {
+  try {
+    const db = await getDbAsync();
+    const now = new Date().toISOString();
+    return await serial(async () => {
+      const existingClosure = await db
+        .select()
+        .from(shadowPaperLegRiskClosures)
+        .where(eq(shadowPaperLegRiskClosures.ledgerId, input.ledgerId))
+        .limit(1);
+      if (existingClosure[0]) {
+        const row = existingClosure[0];
+        return {
+          id: row.id,
+          sessionId: row.sessionId,
+          ledgerId: row.ledgerId,
+          lifecycleId: row.lifecycleId,
+          rejectionCode: row.rejectionCode,
+          closedBy: row.closedBy,
+          closedAt: row.closedAt,
+          evidence: (row.evidence ?? {}) as Record<string, unknown>,
+          note: row.note,
+          reused: true
+        };
+      }
+
+      const ledger = await db
+        .select()
+        .from(shadowPaperLedger)
+        .where(
+          and(
+            eq(shadowPaperLedger.id, input.ledgerId),
+            eq(shadowPaperLedger.sessionId, input.sessionId),
+            eq(shadowPaperLedger.outcome, "LEG_RISK")
+          )
+        )
+        .limit(1);
+      if (!ledger[0]) {
+        throw new Error("LEG_RISK ledger row not found for session");
+      }
+      const id = randomUUID();
+      const evidence = {
+        ...input.evidence,
+        paperOnly: true,
+        realOrders: false,
+        balancesMutated: false,
+        ledgerDeleted: false,
+        fabricatedHedge: false,
+        closedAt: now
+      };
+      await db.insert(shadowPaperLegRiskClosures).values({
+        id,
+        sessionId: input.sessionId,
+        ledgerId: input.ledgerId,
+        lifecycleId: ledger[0].lifecycleId,
+        rejectionCode: ledger[0].rejectionCode,
+        closedBy: input.closedBy,
+        closedAt: now,
+        evidence,
+        note: input.note?.slice(0, 2000) ?? null,
+        createdAt: now
+      });
+      try {
+        await db.insert(auditLogs).values({
+          action: "paper_leg_risk_reconcile",
+          entityType: "shadow_paper_ledger",
+          entityId: input.ledgerId,
+          metadata: {
+            sessionId: input.sessionId,
+            ledgerId: input.ledgerId,
+            lifecycleId: ledger[0].lifecycleId,
+            rejectionCode: ledger[0].rejectionCode,
+            closedBy: input.closedBy,
+            closedAt: now,
+            evidence
+          }
+        });
+      } catch {
+        /* optional in fixtures */
+      }
+      return {
+        id,
+        sessionId: input.sessionId,
+        ledgerId: input.ledgerId,
+        lifecycleId: ledger[0].lifecycleId,
+        rejectionCode: ledger[0].rejectionCode,
+        closedBy: input.closedBy,
+        closedAt: now,
+        evidence,
+        note: input.note?.slice(0, 2000) ?? null,
+        reused: false
+      };
+    });
+  } catch (error) {
+    throw asDbError(error, "reconcilePaperLegRisk");
+  }
+}
+
+/** All non-stopped sessions (should normally be zero or one). */
+export async function listActivePaperSessions(): Promise<PaperSessionRow[]> {
+  try {
+    const db = await getDbAsync();
+    const rows = await serial(async () =>
+      db
+        .select()
+        .from(shadowPaperSessions)
+        .where(inArray(shadowPaperSessions.status, ["NOT_STARTED", "RUNNING", "PAUSED"]))
+        .orderBy(desc(shadowPaperSessions.createdAt))
+    );
+    return rows.map(toSession);
+  } catch {
+    return [];
+  }
+}
+
+export type ReplacePaperCapitalResult = {
+  reused: boolean;
+  oldSessionId: string | null;
+  newSession: PaperSessionRow;
+  capitalPlanId: string;
+  audit: {
+    actor: string;
+    at: string;
+    oldCapitalToman: number | null;
+    newCapitalToman: number;
+    oldSessionId: string | null;
+    newSessionId: string;
+  };
+};
+
+/**
+ * Archive every active Paper session (history preserved) and open exactly one
+ * new RUNNING session at the given capital. Never mutates initial capital in place.
+ *
+ * Idempotent: if the sole active RUNNING session already has this capital and
+ * matching opening book fingerprint in its note, returns that session.
+ */
+export async function replaceActivePaperSessionCapital(input: {
+  totalCapitalToman: number;
+  valuationPriceToman: number;
+  openingAllocations: Array<{ sourceId: string; irtToman: number; usdtUnits: number }>;
+  createdBy: string;
+  /** Client/server preview token for audit trail. */
+  previewToken: string;
+  name?: string;
+  /**
+   * Optional structured session-setup note (includes endsAt / order-cap choice).
+   * Replaces the default capital-replace note body when provided.
+   */
+  sessionNote?: string | null;
+}): Promise<ReplacePaperCapitalResult> {
+  try {
+    const db = await getDbAsync();
+    const now = new Date().toISOString();
+    const capital = Math.round(input.totalCapitalToman);
+    const mark = Math.round(input.valuationPriceToman);
+    const tokenTag = `previewToken=${input.previewToken.slice(0, 16)}`;
+
+    return await serial(async () => {
+      const actives = await db
+        .select()
+        .from(shadowPaperSessions)
+        .where(inArray(shadowPaperSessions.status, ["NOT_STARTED", "RUNNING", "PAUSED"]))
+        .orderBy(desc(shadowPaperSessions.createdAt));
+
+      // Idempotent retry: same capital already RUNNING with this preview token.
+      const match = actives.find(
+        (r) =>
+          r.status === "RUNNING" &&
+          num(r.totalCapitalToman) === capital &&
+          typeof r.note === "string" &&
+          r.note.includes(tokenTag)
+      );
+      if (match && actives.length === 1) {
+        const session = toSession(match);
+        return {
+          reused: true,
+          oldSessionId: null,
+          newSession: session,
+          capitalPlanId: "reused",
+          audit: {
+            actor: input.createdBy,
+            at: now,
+            oldCapitalToman: capital,
+            newCapitalToman: capital,
+            oldSessionId: null,
+            newSessionId: session.id
+          }
+        };
+      }
+
+      const primaryOld = actives[0] ? toSession(actives[0]) : null;
+      const oldIds = actives.map((r) => r.id);
+
+      // Archive — status only; ledger/balances/history rows stay.
+      for (const row of actives) {
+        const archiveNote = [
+          row.note ?? "",
+          `[archived ${now}] capital replace → new session; oldCapital=${num(row.totalCapitalToman)}; actor=${input.createdBy}; ${tokenTag}`
+        ]
+          .filter(Boolean)
+          .join("\n")
+          .slice(0, 2000);
+        await db
+          .update(shadowPaperSessions)
+          .set({
+            status: "STOPPED",
+            stoppedAt: now,
+            updatedAt: now,
+            note: archiveNote
+          })
+          .where(eq(shadowPaperSessions.id, row.id));
+      }
+
+      // Capital plan snapshot (append-only).
+      const planId = randomUUID();
+      await db.insert(shadowCapitalPlans).values({
+        id: planId,
+        name: `Paper capital ${capital.toLocaleString("en-US")} toman`,
+        mode: "MANUAL",
+        totalCapitalToman: capital,
+        valuationPriceToman: mark,
+        reservePercent: 0,
+        allocations: input.openingAllocations,
+        createdBy: input.createdBy,
+        note: JSON.stringify({
+          kind: "paper_session_capital_replace",
+          actor: input.createdBy,
+          at: now,
+          oldSessionIds: oldIds,
+          oldCapitalToman: primaryOld?.totalCapitalToman ?? null,
+          newCapitalToman: capital,
+          previewToken: input.previewToken,
+          unit: "toman"
+        }),
+        createdAt: now
+      });
+
+      const newId = randomUUID();
+      const newName =
+        input.name?.trim().slice(0, 80) ||
+        `نشست کاغذی ${capital.toLocaleString("en-US")} تومان`;
+      const defaultNote = [
+        `Paper capital replace`,
+        `actor=${input.createdBy}`,
+        `at=${now}`,
+        `oldSessionId=${primaryOld?.id ?? "none"}`,
+        `oldCapital=${primaryOld?.totalCapitalToman ?? "none"}`,
+        `newCapital=${capital}`,
+        `planId=${planId}`,
+        tokenTag,
+        `unit=toman`
+      ].join("; ");
+      const newNote = (input.sessionNote?.trim() || defaultNote).slice(0, 2000);
+
+      const newRow = {
+        id: newId,
+        observationId: primaryOld?.observationId ?? null,
+        name: newName,
+        mode: "APPROVED_PLAN" as const,
+        status: "RUNNING" as const,
+        totalCapitalToman: capital,
+        valuationPriceToman: mark,
+        openingAllocations: input.openingAllocations,
+        approvalFingerprint: `session-capital|${input.previewToken.slice(0, 32)}`,
+        createdBy: input.createdBy,
+        startedAt: now,
+        pausedAt: null,
+        stoppedAt: null,
+        lastCycleAt: null,
+        cyclesEvaluated: 0,
+        tradesExecuted: 0,
+        candidatesSkipped: 0,
+        note: newNote,
+        experimentRunId: null as string | null,
+        createdAt: now,
+        updatedAt: now
+      };
+
+      await db.insert(shadowPaperSessions).values(newRow);
+      for (const a of input.openingAllocations) {
+        await db.insert(shadowPaperBalances).values({
+          id: `${newId}|${a.sourceId}`,
+          sessionId: newId,
+          sourceId: a.sourceId,
+          irtToman: Math.max(0, Math.round(a.irtToman)),
+          usdtMicros: Math.max(0, Math.round(a.usdtUnits * 1_000_000)),
+          updatedAt: now
+        });
+      }
+
+      // Best-effort desk audit log (actor ids optional).
+      try {
+        await db.insert(auditLogs).values({
+          action: "paper_session_capital_replace",
+          entityType: "shadow_paper_session",
+          entityId: newId,
+          metadata: {
+            actor: input.createdBy,
+            at: now,
+            oldSessionId: primaryOld?.id ?? null,
+            newSessionId: newId,
+            oldCapitalToman: primaryOld?.totalCapitalToman ?? null,
+            newCapitalToman: capital,
+            capitalPlanId: planId,
+            previewToken: input.previewToken,
+            unit: "toman"
+          }
+        });
+      } catch {
+        /* audit table may be unavailable in some local fixtures */
+      }
+
+      return {
+        reused: false,
+        oldSessionId: primaryOld?.id ?? null,
+        newSession: toSession(newRow as typeof shadowPaperSessions.$inferSelect),
+        capitalPlanId: planId,
+        audit: {
+          actor: input.createdBy,
+          at: now,
+          oldCapitalToman: primaryOld?.totalCapitalToman ?? null,
+          newCapitalToman: capital,
+          oldSessionId: primaryOld?.id ?? null,
+          newSessionId: newId
+        }
+      };
+    });
+  } catch (error) {
+    throw asDbError(error, "replaceActivePaperSessionCapital");
+  }
+}
+
+export async function loadPaperBalances(sessionId: string): Promise<PaperBalanceRow[]> {
+  try {
+    const db = await getDbAsync();
+    const rows = await serial(async () =>
+      db.select().from(shadowPaperBalances).where(eq(shadowPaperBalances.sessionId, sessionId))
+    );
+    return rows
+      .map((r) => ({
+        sourceId: r.sourceId,
+        irtToman: num(r.irtToman),
+        usdtMicros: num(r.usdtMicros)
+      }))
+      .sort((a, b) => a.sourceId.localeCompare(b.sourceId));
+  } catch {
+    return [];
+  }
+}
+
+/** Lifecycle ids this session already filled — the idempotency memory. */
+export async function loadFilledLifecycleIds(sessionId: string): Promise<Set<string>> {
+  try {
+    const db = await getDbAsync();
+    const rows = await serial(async () =>
+      db
+        .select({ lifecycleId: shadowPaperLedger.lifecycleId })
+        .from(shadowPaperLedger)
+        .where(and(eq(shadowPaperLedger.sessionId, sessionId), inArray(shadowPaperLedger.outcome, ["FILLED", "LEG_RISK"])))
+    );
+    return new Set(rows.map((r) => r.lifecycleId));
+  } catch {
+    return new Set();
+  }
+}
+
+export type PaperFillRecord = {
+  executionOutcome?: "FILLED" | "LEG_RISK";
+  executionEvidence?: Record<string, unknown> | null;
+  lifecycleId: string;
+  routeKey: string;
+  buySourceId: string;
+  sellSourceId: string;
+  sizeUsdt: number;
+  buyVwapToman: number;
+  sellVwapToman: number;
+  buyNotionalToman: number;
+  sellNotionalToman: number;
+  buyFeeBps: number;
+  sellFeeBps: number;
+  buyFeeAsset: string;
+  buyFeeDebitMode: string;
+  buyFeeProvenance: string;
+  sellFeeAsset: string;
+  sellFeeDebitMode: string;
+  sellFeeProvenance: string;
+  feeTomanTotal: number;
+  feeUsdtMicrosTotal: number;
+  slippageBufferToman: number;
+  grossSpreadToman: number;
+  markPriceToman: number;
+  cashPnlIrtToman: number;
+  inventoryDeltaUsdtMicros: number;
+  sellFeeValueToman: number;
+  economicNetPnlToman: number;
+  riskAdjustedPnlToman: number;
+  balancesAfter: Array<{ sourceId: string; irtToman: number; usdtMicros: number }>;
+  /**
+   * SMART_CAPITAL_DEPTH decision evidence.
+   *
+   * Optional on the type so a caller that has no sizing context still writes a
+   * valid fill — the columns are nullable and a null means "not recorded",
+   * never a value that was invented to fill the gap.
+   */
+  sizing?: {
+    policy: string;
+    reason: string;
+    limitingSide: string;
+    limitingSourceId: string;
+    limitingUsableUsdtMicros: number;
+    capitalCapUsdtMicros: number;
+    depthCapUsdtMicros: number;
+    bindingConstraint: string | null;
+    riskAdjustedReturnBps: number;
+    selectedPercentOfUsable: number | null;
+    inventoryImpactPoints: number | null;
+    nextLargerSizeUsdt: number | null;
+    nextLargerRejectionCode: string | null;
+    nextLargerRejectionReason: string | null;
+    nextLargerMarginalPnlToman: number | null;
+    /** Complete final sizing audit (restart-stable). Optional; write failures must not alter fill. */
+    audit?: Record<string, unknown> | null;
+  };
+  /** Step 2 durable identity — required for NEW fills (null only for legacy callers/tests). */
+  decisionTraceId?: string | null;
+  experimentId?: string | null;
+  deploymentVersion?: string | null;
+  collectorRunId?: string | null;
+  observationId?: string | null;
+  detectionSnapshotRef?: Record<string, unknown> | null;
+  arrivalSnapshotRef?: Record<string, unknown> | null;
+  allocatorDecisionRef?: Record<string, unknown> | null;
+  liquidityConsumptionEvidence?: Record<string, unknown> | null;
+  liquidityConsumeLevels?: Array<{
+    venueId: string;
+    symbol: string;
+    side: string;
+    priceToman: number;
+    quantityMicros: number;
+    rawDisplayedMicros: number | null;
+    immutableGeneration: string | null;
+    immutableBookHash: string | null;
+    rawSnapshotId: string | null;
+    arrivalSnapshotId: string | null;
+  }>;
+  liquidityConsumeReason?: string | null;
+};
+
+export type PaperSkipRecord = {
+  lifecycleId: string;
+  routeKey: string;
+  buySourceId: string;
+  sellSourceId: string;
+  sizeUsdt: number;
+  /** Deterministic primary cause — never a generic message. */
+  rejectionCode: string;
+  /** Every exact cause that applied, canonically ordered. */
+  reasonCodes: string[];
+  rejectionReason: string;
+  requiredRebalance: string | null;
+  /**
+   * PAPER-V2 Phase 1B — reject diagnostics persisted into sizing_audit JSONB
+   * so false-negative forensics do not rely on estimates.
+   */
+  diagnostics?: Record<string, unknown> | null;
+  /** Optional VWAP/econ snapshot when already computable at reject time. */
+  buyVwapToman?: number | null;
+  sellVwapToman?: number | null;
+  buyFeeBps?: number | null;
+  sellFeeBps?: number | null;
+  grossSpreadToman?: number | null;
+  economicNetPnlToman?: number | null;
+  riskAdjustedPnlToman?: number | null;
+};
+
+export type PaperCandidateStateRow = {
+  lifecycleId: string;
+  routeKey: string;
+  buySourceId: string;
+  sellSourceId: string;
+  sizeUsdt: number;
+  decisionKey: string;
+  outcome: string;
+  primaryReason: string | null;
+  reasonCodes: string[];
+  occurrences: number;
+  firstSeenAt: string;
+  lastSeenAt: string;
+  lastChangedAt: string;
+  closedAt: string | null;
+};
+
+export type PaperCycleSummaryRow = {
+  id: string;
+  occurredAt: string;
+  candidatesEvaluated: number;
+  filled: number;
+  skipped: number;
+  detailedEventsWritten: number;
+  reasonCounts: Record<string, number>;
+};
+
+function decisionKeyOf(outcome: string, reasonCodes: string[]): string {
+  return `${outcome}:${[...reasonCodes].sort().join(",")}`;
+}
+
+/**
+ * Commit one cycle's decisions.
+ *
+ * Volume discipline (v4.9.1): a detailed, immutable ledger row is written ONLY
+ * when something actually changed for a candidate — it is seen for the first
+ * time, its decision key changes, it fills, or it disappears from the market.
+ * An unchanged blocked candidate only bumps a counter on its state row, so a
+ * steady state costs one compact summary per cycle instead of one row per
+ * candidate per cycle.
+ *
+ * Fills and balance updates still happen inside a single transaction, and the
+ * unique index on the idempotency key still refuses a second fill of the same
+ * lifecycle.
+ */
+export async function commitPaperCycle(input: {
+  sessionId: string;
+  requireRunning?: boolean;
+  runId: string | null;
+  occurredAt: string;
+  fills: PaperFillRecord[];
+  skips: PaperSkipRecord[];
+  /** Pre-allocated decision trace id shared by all NEW fills this cycle. */
+  decisionTraceId?: string | null;
+  experimentId?: string | null;
+  deploymentVersion?: string | null;
+  observationId?: string | null;
+}): Promise<{
+  filled: number;
+  skipped: number;
+  duplicates: number;
+  detailedEventsWritten: number;
+  reasonCounts: Record<string, number>;
+}> {
+  const db = await getDbAsync();
+  let filled = 0;
+  let duplicates = 0;
+  let detailedEventsWritten = 0;
+  const reasonCounts: Record<string, number> = {};
+
+  try {
+    await serial(async () => {
+      // Existing decision state for this session, keyed by lifecycle.
+      const stateRows = await db
+        .select()
+        .from(shadowPaperCandidateState)
+        .where(eq(shadowPaperCandidateState.sessionId, input.sessionId));
+      const stateByLifecycle = new Map(stateRows.map((r) => [r.lifecycleId, r]));
+      const seen = new Set<string>();
+
+      const upsertState = async (
+        rec: {
+          lifecycleId: string;
+          routeKey: string;
+          buySourceId: string;
+          sellSourceId: string;
+          sizeUsdt: number;
+        },
+        outcome: string,
+        primary: string | null,
+        codes: string[]
+      ): Promise<"NEW" | "CHANGED" | "UNCHANGED"> => {
+        const key = decisionKeyOf(outcome, codes);
+        const existing = stateByLifecycle.get(rec.lifecycleId);
+        if (!existing) {
+          await db.insert(shadowPaperCandidateState).values({
+            id: `${input.sessionId}|${rec.lifecycleId}`,
+            sessionId: input.sessionId,
+            lifecycleId: rec.lifecycleId,
+            routeKey: rec.routeKey,
+            buySourceId: rec.buySourceId,
+            sellSourceId: rec.sellSourceId,
+            sizeUsdt: String(rec.sizeUsdt),
+            decisionKey: key,
+            outcome,
+            primaryReason: primary,
+            reasonCodes: codes,
+            occurrences: 1,
+            firstSeenAt: input.occurredAt,
+            lastSeenAt: input.occurredAt,
+            lastChangedAt: input.occurredAt,
+            closedAt: null
+          });
+          return "NEW";
+        }
+        if (existing.decisionKey === key && !existing.closedAt) {
+          // Nothing changed: only the observation counter moves.
+          await db
+            .update(shadowPaperCandidateState)
+            .set({ occurrences: existing.occurrences + 1, lastSeenAt: input.occurredAt })
+            .where(eq(shadowPaperCandidateState.id, `${input.sessionId}|${rec.lifecycleId}`));
+          return "UNCHANGED";
+        }
+        await db
+          .update(shadowPaperCandidateState)
+          .set({
+            decisionKey: key,
+            outcome,
+            primaryReason: primary,
+            reasonCodes: codes,
+            occurrences: existing.occurrences + 1,
+            lastSeenAt: input.occurredAt,
+            lastChangedAt: input.occurredAt,
+            closedAt: null
+          })
+          .where(eq(shadowPaperCandidateState.id, `${input.sessionId}|${rec.lifecycleId}`));
+        return "CHANGED";
+      };
+
+      for (const f of input.fills) {
+        let fillId = "";
+        seen.add(f.lifecycleId);
+        const key = `${input.sessionId}|${f.lifecycleId}`;
+        try {
+          await db.transaction(async (tx) => {
+            if (input.requireRunning) {
+              const [active] = await tx.select().from(shadowPaperSessions).where(eq(shadowPaperSessions.id,input.sessionId));
+              if (!active || active.status !== "RUNNING") throw new Error("paper session no longer running");
+            }
+            await tx.insert(shadowPaperLedger).values({
+              id: (fillId = randomUUID()),
+              sessionId: input.sessionId,
+              runId: input.runId,
+              idempotencyKey: key,
+              lifecycleId: f.lifecycleId,
+              routeKey: f.routeKey,
+              outcome: f.executionOutcome ?? "FILLED",
+              eventType: f.executionOutcome ?? "FILLED",
+              reasonCodes: f.executionOutcome === "LEG_RISK" ? ["leg_risk_second_leg_failed"] : [],
+              rejectionCode: f.executionOutcome === "LEG_RISK" ? "leg_risk_second_leg_failed" : null,
+              rejectionReason: f.executionOutcome === "LEG_RISK" ? "معامله نیمه‌تمام؛ موجودی پای اول ثبت شد و جلسه متوقف است" : null,
+              requiredRebalance: null,
+              buySourceId: f.buySourceId,
+              sellSourceId: f.sellSourceId,
+              sizeUsdt: String(f.sizeUsdt),
+              buyVwapToman: f.buyVwapToman,
+              sellVwapToman: f.sellVwapToman,
+              buyNotionalToman: f.buyNotionalToman,
+              sellNotionalToman: f.sellNotionalToman,
+              buyFeeBps: f.buyFeeBps,
+              sellFeeBps: f.sellFeeBps,
+              buyFeeAsset: f.buyFeeAsset,
+              buyFeeDebitMode: f.buyFeeDebitMode,
+              buyFeeProvenance: f.buyFeeProvenance,
+              sellFeeAsset: f.sellFeeAsset,
+              sellFeeDebitMode: f.sellFeeDebitMode,
+              sellFeeProvenance: f.sellFeeProvenance,
+              feeTomanTotal: f.feeTomanTotal,
+              feeUsdtMicrosTotal: f.feeUsdtMicrosTotal,
+              slippageBufferToman: f.slippageBufferToman,
+              grossSpreadToman: f.grossSpreadToman,
+              markPriceToman: f.markPriceToman,
+              cashPnlIrtToman: f.cashPnlIrtToman,
+              inventoryDeltaUsdtMicros: f.inventoryDeltaUsdtMicros,
+              sellFeeValueToman: f.sellFeeValueToman,
+              economicNetPnlToman: f.economicNetPnlToman,
+              riskAdjustedPnlToman: f.riskAdjustedPnlToman,
+              balancesAfter: f.balancesAfter,
+              sizingPolicy: f.sizing?.policy ?? null,
+              sizingReason: f.sizing?.reason ?? null,
+              limitingSide: f.sizing?.limitingSide ?? null,
+              limitingSourceId: f.sizing?.limitingSourceId ?? null,
+              limitingUsableUsdtMicros: f.sizing?.limitingUsableUsdtMicros ?? null,
+              capitalCapUsdtMicros: f.sizing?.capitalCapUsdtMicros ?? null,
+              depthCapUsdtMicros: f.sizing?.depthCapUsdtMicros ?? null,
+              bindingConstraint: f.sizing?.bindingConstraint ?? null,
+              riskAdjustedReturnBps:
+                f.sizing === undefined ? null : String(f.sizing.riskAdjustedReturnBps),
+              selectedPercentOfUsable:
+                f.sizing?.selectedPercentOfUsable === undefined ||
+                f.sizing?.selectedPercentOfUsable === null
+                  ? null
+                  : String(f.sizing.selectedPercentOfUsable),
+              inventoryImpactPoints:
+                f.sizing?.inventoryImpactPoints === undefined ||
+                f.sizing?.inventoryImpactPoints === null
+                  ? null
+                  : String(f.sizing.inventoryImpactPoints),
+              nextLargerSizeUsdt:
+                f.sizing?.nextLargerSizeUsdt === undefined || f.sizing?.nextLargerSizeUsdt === null
+                  ? null
+                  : String(f.sizing.nextLargerSizeUsdt),
+              nextLargerRejectionCode: f.sizing?.nextLargerRejectionCode ?? null,
+              nextLargerRejectionReason: f.sizing?.nextLargerRejectionReason ?? null,
+              nextLargerMarginalPnlToman: f.sizing?.nextLargerMarginalPnlToman ?? null,
+              sizingAudit: f.executionEvidence ? { ...(f.sizing?.audit ?? {}), delayedRecheck:f.executionEvidence,
+                executionOutcome:f.executionOutcome ?? "FILLED" } : f.sizing?.audit ?? null,
+              decisionTraceId: f.decisionTraceId ?? input.decisionTraceId ?? null,
+              experimentId: f.experimentId ?? input.experimentId ?? null,
+              deploymentVersion: f.deploymentVersion ?? input.deploymentVersion ?? null,
+              collectorRunId: f.collectorRunId ?? input.runId ?? null,
+              observationId: f.observationId ?? input.observationId ?? null,
+              detectionSnapshotRef: f.detectionSnapshotRef ?? null,
+              arrivalSnapshotRef: f.arrivalSnapshotRef ?? null,
+              allocatorDecisionRef: f.allocatorDecisionRef ?? null,
+              liquidityConsumptionEvidence: f.liquidityConsumptionEvidence ?? (
+                f.liquidityConsumeLevels?.length
+                  ? {
+                      version: "paper_residual_liquidity_v1",
+                      reason: f.liquidityConsumeReason ?? "fill_consume",
+                      levels: f.liquidityConsumeLevels
+                    }
+                  : null
+              ),
+              occurredAt: input.occurredAt,
+              createdAt: input.occurredAt
+            });
+            // Atomic with fill: persist residual consumption (idempotent on retry).
+            if (f.liquidityConsumeLevels?.length) {
+              const { persistResidualConsumption } = await import(
+                "@/db/repositories/shadowResidualLiquidity"
+              );
+              await persistResidualConsumption(
+                {
+                  paperSessionId: input.sessionId,
+                  levels: f.liquidityConsumeLevels as never,
+                  reason: (f.liquidityConsumeReason as never) ?? "fill_consume",
+                  fillLedgerId: fillId,
+                  lifecycleId: f.lifecycleId,
+                  decisionTraceId: f.decisionTraceId ?? input.decisionTraceId ?? null,
+                  occurredAt: input.occurredAt,
+                  evidence: { executionOutcome: f.executionOutcome ?? "FILLED" }
+                },
+                tx as never
+              );
+            }
+            if (f.executionOutcome === "LEG_RISK") {
+              await tx.update(shadowPaperSessions).set({status:"PAUSED",pausedAt:input.occurredAt,updatedAt:input.occurredAt}).where(eq(shadowPaperSessions.id,input.sessionId));
+            }
+            for (const b of f.balancesAfter) {
+              // A negative balance must never reach the database.
+              if (b.irtToman < 0 || b.usdtMicros < 0) {
+                throw new Error(`refusing negative paper balance for ${b.sourceId}`);
+              }
+              await tx
+                .update(shadowPaperBalances)
+                .set({
+                  irtToman: Math.round(b.irtToman),
+                  usdtMicros: Math.round(b.usdtMicros),
+                  updatedAt: input.occurredAt
+                })
+                .where(eq(shadowPaperBalances.id, `${input.sessionId}|${b.sourceId}`));
+            }
+          });
+          if (f.executionOutcome !== "LEG_RISK") filled += 1;
+          else reasonCounts["leg_risk_second_leg_failed"] = (reasonCounts["leg_risk_second_leg_failed"] ?? 0)+1;
+          detailedEventsWritten += 1;
+        } catch (e) {
+          // A duplicate simply means this lifecycle was already filled — that is
+          // the idempotency guard working, not a failure. Anything else is real.
+          if (isUniqueViolation(e)) {
+            duplicates += 1;
+          } else {
+            throw e;
+          }
+        }
+        await upsertState(f, f.executionOutcome ?? "FILLED", f.executionOutcome === "LEG_RISK" ? "leg_risk_second_leg_failed" : null, f.executionOutcome === "LEG_RISK" ? ["leg_risk_second_leg_failed"] : []);
+      }
+
+      for (const k of input.skips) {
+        seen.add(k.lifecycleId);
+        const codes = k.reasonCodes?.length ? k.reasonCodes : [k.rejectionCode];
+        reasonCounts[k.rejectionCode] = (reasonCounts[k.rejectionCode] ?? 0) + 1;
+
+        const transition = await upsertState(k, "SKIPPED", k.rejectionCode, codes);
+        // THE volume rule: an unchanged blocked candidate writes no detail row.
+        if (transition === "UNCHANGED") continue;
+
+        await db.insert(shadowPaperLedger).values({
+          id: randomUUID(),
+          sessionId: input.sessionId,
+          runId: input.runId,
+          // Skips carry no idempotency key: several transitions are legitimate.
+          idempotencyKey: null,
+          lifecycleId: k.lifecycleId,
+          routeKey: k.routeKey,
+          outcome: "SKIPPED",
+          eventType: transition === "NEW" ? "FIRST_SEEN" : "CHANGED",
+          reasonCodes: codes,
+          rejectionCode: k.rejectionCode,
+          rejectionReason: k.rejectionReason,
+          requiredRebalance: k.requiredRebalance,
+          buySourceId: k.buySourceId,
+          sellSourceId: k.sellSourceId,
+          sizeUsdt: String(k.sizeUsdt),
+          buyVwapToman: k.buyVwapToman ?? null,
+          sellVwapToman: k.sellVwapToman ?? null,
+          buyFeeBps: k.buyFeeBps ?? null,
+          sellFeeBps: k.sellFeeBps ?? null,
+          grossSpreadToman: k.grossSpreadToman ?? null,
+          economicNetPnlToman: k.economicNetPnlToman ?? null,
+          riskAdjustedPnlToman: k.riskAdjustedPnlToman ?? null,
+          sizingAudit: k.diagnostics ?? null,
+          balancesAfter: [],
+          occurredAt: input.occurredAt,
+          createdAt: input.occurredAt
+        });
+        detailedEventsWritten += 1;
+      }
+
+      // Candidates that vanished from the market: one CLOSED event each, once.
+      for (const row of stateRows) {
+        if (seen.has(row.lifecycleId) || row.closedAt) continue;
+        await db
+          .update(shadowPaperCandidateState)
+          .set({ closedAt: input.occurredAt })
+          .where(eq(shadowPaperCandidateState.id, row.id));
+        await db.insert(shadowPaperLedger).values({
+          id: randomUUID(),
+          sessionId: input.sessionId,
+          runId: input.runId,
+          idempotencyKey: null,
+          lifecycleId: row.lifecycleId,
+          routeKey: row.routeKey,
+          outcome: "SKIPPED",
+          eventType: "CLOSED",
+          reasonCodes: ["opportunity_left_market"],
+          rejectionCode: "opportunity_left_market",
+          rejectionReason: "فرصت از بازار خارج شد",
+          requiredRebalance: null,
+          buySourceId: row.buySourceId,
+          sellSourceId: row.sellSourceId,
+          sizeUsdt: String(row.sizeUsdt),
+          balancesAfter: [],
+          occurredAt: input.occurredAt,
+          createdAt: input.occurredAt
+        });
+        detailedEventsWritten += 1;
+      }
+
+      // One compact summary per cycle, regardless of candidate count.
+      await db.insert(shadowPaperCycleSummaries).values({
+        id: randomUUID(),
+        sessionId: input.sessionId,
+        runId: input.runId,
+        occurredAt: input.occurredAt,
+        candidatesEvaluated: input.fills.length + input.skips.length,
+        filled,
+        skipped: input.skips.length,
+        detailedEventsWritten,
+        reasonCounts,
+        createdAt: input.occurredAt
+      });
+
+      await db
+        .update(shadowPaperSessions)
+        .set({ lastCycleAt: input.occurredAt, updatedAt: input.occurredAt })
+        .where(eq(shadowPaperSessions.id, input.sessionId));
+    });
+  } catch (error) {
+    throw asDbError(error, "commitPaperCycle");
+  }
+
+  await bumpSessionCounters(input.sessionId, filled, input.skips.length);
+  return { filled, skipped: input.skips.length, duplicates, detailedEventsWritten, reasonCounts };
+}
+
+/** Current decision state per candidate — the grouped view the UI reads. */
+export async function loadCandidateStates(
+  sessionId: string,
+  options: { reason?: string; openOnly?: boolean; limit?: number } = {}
+): Promise<PaperCandidateStateRow[]> {
+  try {
+    const db = await getDbAsync();
+    const rows = await serial(async () => {
+      const filters = [eq(shadowPaperCandidateState.sessionId, sessionId)];
+      if (options.reason) filters.push(eq(shadowPaperCandidateState.primaryReason, options.reason));
+      if (options.openOnly) filters.push(isNull(shadowPaperCandidateState.closedAt));
+      return db
+        .select()
+        .from(shadowPaperCandidateState)
+        .where(and(...filters))
+        .orderBy(desc(shadowPaperCandidateState.lastSeenAt))
+        .limit(Math.min(500, Math.max(1, options.limit ?? 200)));
+    });
+    return rows.map((r) => ({
+      lifecycleId: r.lifecycleId,
+      routeKey: r.routeKey,
+      buySourceId: r.buySourceId,
+      sellSourceId: r.sellSourceId,
+      sizeUsdt: num(r.sizeUsdt),
+      decisionKey: r.decisionKey,
+      outcome: r.outcome,
+      primaryReason: r.primaryReason,
+      reasonCodes: Array.isArray(r.reasonCodes) ? r.reasonCodes : [],
+      occurrences: r.occurrences,
+      firstSeenAt: r.firstSeenAt,
+      lastSeenAt: r.lastSeenAt,
+      lastChangedAt: r.lastChangedAt,
+      closedAt: r.closedAt
+    }));
+  } catch {
+    return [];
+  }
+}
+
+/** Grouped block reasons with counts — computed from state, not from raw rows. */
+export async function loadReasonBreakdown(
+  sessionId: string
+): Promise<Array<{ code: string; candidates: number; observations: number }>> {
+  try {
+    const db = await getDbAsync();
+    const rows = await serial(async () =>
+      db
+        .select({
+          code: shadowPaperCandidateState.primaryReason,
+          candidates: sql<number>`count(*)`,
+          observations: sql<number>`sum(${shadowPaperCandidateState.occurrences})`
+        })
+        .from(shadowPaperCandidateState)
+        .where(
+          and(
+            eq(shadowPaperCandidateState.sessionId, sessionId),
+            eq(shadowPaperCandidateState.outcome, "SKIPPED")
+          )
+        )
+        .groupBy(shadowPaperCandidateState.primaryReason)
+    );
+    return rows
+      .filter((r) => r.code)
+      .map((r) => ({
+        code: String(r.code),
+        candidates: num(r.candidates),
+        observations: num(r.observations)
+      }))
+      .sort((a, b) => b.observations - a.observations || a.code.localeCompare(b.code));
+  } catch {
+    return [];
+  }
+}
+
+export async function loadCycleSummaries(
+  sessionId: string,
+  limit = 100
+): Promise<PaperCycleSummaryRow[]> {
+  try {
+    const db = await getDbAsync();
+    const rows = await serial(async () =>
+      db
+        .select()
+        .from(shadowPaperCycleSummaries)
+        .where(eq(shadowPaperCycleSummaries.sessionId, sessionId))
+        .orderBy(desc(shadowPaperCycleSummaries.occurredAt))
+        .limit(Math.min(500, Math.max(1, limit)))
+    );
+    return rows.map((r) => ({
+      id: r.id,
+      occurredAt: r.occurredAt,
+      candidatesEvaluated: r.candidatesEvaluated,
+      filled: r.filled,
+      skipped: r.skipped,
+      detailedEventsWritten: r.detailedEventsWritten,
+      reasonCounts: (r.reasonCounts ?? {}) as Record<string, number>
+    }));
+  } catch {
+    return [];
+  }
+}
+
+async function bumpSessionCounters(sessionId: string, filled: number, skipped: number) {
+  try {
+    const db = await getDbAsync();
+    await serial(async () => {
+      const rows = await db
+        .select({
+          cyclesEvaluated: shadowPaperSessions.cyclesEvaluated,
+          tradesExecuted: shadowPaperSessions.tradesExecuted,
+          candidatesSkipped: shadowPaperSessions.candidatesSkipped
+        })
+        .from(shadowPaperSessions)
+        .where(eq(shadowPaperSessions.id, sessionId))
+        .limit(1);
+      const cur = rows[0];
+      if (!cur) return;
+      await db
+        .update(shadowPaperSessions)
+        .set({
+          cyclesEvaluated: cur.cyclesEvaluated + 1,
+          tradesExecuted: cur.tradesExecuted + filled,
+          candidatesSkipped: cur.candidatesSkipped + skipped
+        })
+        .where(eq(shadowPaperSessions.id, sessionId));
+    });
+  } catch {
+    // Counters are reporting only; the ledger is the source of truth.
+  }
+}
+
+/** Total ledger rows for a session (pagination total, no row cap). */
+export async function countPaperLedger(
+  sessionId: string,
+  options: { outcome?: "FILLED" | "SKIPPED" } = {}
+): Promise<number> {
+  try {
+    const db = await getDbAsync();
+    const rows = await serial(async () => {
+      const where = options.outcome
+        ? and(eq(shadowPaperLedger.sessionId, sessionId), eq(shadowPaperLedger.outcome, options.outcome))
+        : eq(shadowPaperLedger.sessionId, sessionId);
+      return db
+        .select({ n: sql<number>`count(*)::int` })
+        .from(shadowPaperLedger)
+        .where(where);
+    });
+    return Number(rows[0]?.n ?? 0);
+  } catch {
+    return 0;
+  }
+}
+
+export async function loadPaperLedger(
+  sessionId: string,
+  options: {
+    outcome?: "FILLED" | "SKIPPED" | "LEG_RISK";
+    limit?: number;
+    /** Server-side offset for pagination (no silent 2,000-row UI cap). */
+    offset?: number;
+  } = {}
+): Promise<PaperLedgerRow[]> {
+  try {
+    const db = await getDbAsync();
+    // Financial history is permanent: allow large pages for export; default stays modest.
+    const limit = Math.min(50_000, Math.max(1, options.limit ?? 200));
+    const offset = Math.max(0, options.offset ?? 0);
+    const rows = await serial(async () => {
+      const where = options.outcome
+        ? and(eq(shadowPaperLedger.sessionId, sessionId), eq(shadowPaperLedger.outcome, options.outcome))
+        : eq(shadowPaperLedger.sessionId, sessionId);
+      return db
+        .select()
+        .from(shadowPaperLedger)
+        .where(where)
+        .orderBy(desc(shadowPaperLedger.occurredAt))
+        .limit(limit)
+        .offset(offset);
+    });
+    return rows.map((r) => ({
+      id: r.id,
+      eventType: r.eventType,
+      reasonCodes: Array.isArray(r.reasonCodes) ? r.reasonCodes : [],
+      sessionId: r.sessionId,
+      runId: r.runId,
+      lifecycleId: r.lifecycleId,
+      routeKey: r.routeKey,
+      outcome: r.outcome === "FILLED" ? "FILLED" : r.outcome === "LEG_RISK" ? "LEG_RISK" : "SKIPPED",
+      rejectionCode: r.rejectionCode,
+      rejectionReason: r.rejectionReason,
+      requiredRebalance: r.requiredRebalance,
+      buySourceId: r.buySourceId,
+      sellSourceId: r.sellSourceId,
+      sizeUsdt: num(r.sizeUsdt),
+      buyVwapToman: numOrNull(r.buyVwapToman),
+      sellVwapToman: numOrNull(r.sellVwapToman),
+      buyNotionalToman: numOrNull(r.buyNotionalToman),
+      sellNotionalToman: numOrNull(r.sellNotionalToman),
+      buyFeeBps: numOrNull(r.buyFeeBps),
+      sellFeeBps: numOrNull(r.sellFeeBps),
+      buyFeeAsset: r.buyFeeAsset,
+      buyFeeDebitMode: r.buyFeeDebitMode,
+      buyFeeProvenance: r.buyFeeProvenance,
+      sellFeeAsset: r.sellFeeAsset,
+      sellFeeDebitMode: r.sellFeeDebitMode,
+      sellFeeProvenance: r.sellFeeProvenance,
+      feeTomanTotal: numOrNull(r.feeTomanTotal),
+      feeUsdtMicrosTotal: numOrNull(r.feeUsdtMicrosTotal),
+      sizingPolicy: r.sizingPolicy,
+      sizingReason: r.sizingReason,
+      limitingSide: r.limitingSide,
+      limitingSourceId: r.limitingSourceId,
+      limitingUsableUsdtMicros: numOrNull(r.limitingUsableUsdtMicros),
+      capitalCapUsdtMicros: numOrNull(r.capitalCapUsdtMicros),
+      depthCapUsdtMicros: numOrNull(r.depthCapUsdtMicros),
+      bindingConstraint: r.bindingConstraint,
+      riskAdjustedReturnBps: numOrNull(r.riskAdjustedReturnBps),
+      selectedPercentOfUsable: numOrNull(r.selectedPercentOfUsable),
+      inventoryImpactPoints: numOrNull(r.inventoryImpactPoints),
+      nextLargerSizeUsdt: numOrNull(r.nextLargerSizeUsdt),
+      nextLargerRejectionCode: r.nextLargerRejectionCode,
+      nextLargerRejectionReason: r.nextLargerRejectionReason,
+      nextLargerMarginalPnlToman: numOrNull(r.nextLargerMarginalPnlToman),
+      sizingAudit:
+        r.sizingAudit && typeof r.sizingAudit === "object"
+          ? (r.sizingAudit as Record<string, unknown>)
+          : null,
+      slippageBufferToman: numOrNull(r.slippageBufferToman),
+      grossSpreadToman: numOrNull(r.grossSpreadToman),
+      markPriceToman: numOrNull(r.markPriceToman),
+      cashPnlIrtToman: numOrNull(r.cashPnlIrtToman),
+      inventoryDeltaUsdtMicros: numOrNull(r.inventoryDeltaUsdtMicros),
+      sellFeeValueToman: numOrNull(r.sellFeeValueToman),
+      economicNetPnlToman: numOrNull(r.economicNetPnlToman),
+      riskAdjustedPnlToman: numOrNull(r.riskAdjustedPnlToman),
+      balancesAfter: Array.isArray(r.balancesAfter) ? r.balancesAfter : [],
+      experimentRunId: r.experimentRunId ?? null,
+      occurredAt: r.occurredAt
+    }));
+  } catch {
+    return [];
+  }
+}
+
+/** Aggregates for the dashboard and the health endpoint. */
+export async function loadPaperStats(sessionId: string): Promise<{
+  filled: number;
+  legRisk: number;
+  skipped: number;
+  cashPnlIrtToman: number;
+  inventoryDeltaUsdtMicros: number;
+  sellFeeValueToman: number;
+  economicNetPnlToman: number;
+  riskAdjustedPnlToman: number;
+  feeTomanTotal: number;
+  feeUsdtMicrosTotal: number;
+  blockReasons: Array<{ code: string; reasonFa: string; count: number }>;
+  lastFillAt: string | null;
+}> {
+  const empty = {
+    filled: 0,
+    legRisk: 0,
+    skipped: 0,
+    cashPnlIrtToman: 0,
+    inventoryDeltaUsdtMicros: 0,
+    sellFeeValueToman: 0,
+    economicNetPnlToman: 0,
+    riskAdjustedPnlToman: 0,
+    feeTomanTotal: 0,
+    feeUsdtMicrosTotal: 0,
+    blockReasons: [] as Array<{ code: string; reasonFa: string; count: number }>,
+    lastFillAt: null as string | null
+  };
+  try {
+    const rows = await loadPaperLedger(sessionId, { limit: 500 });
+    const fills = rows.filter((r) => r.outcome === "FILLED");
+    const risks = rows.filter((r) => r.outcome === "LEG_RISK");
+    const settlements = [...fills, ...risks];
+    const skips = rows.filter((r) => r.outcome === "SKIPPED");
+    const byReason = new Map<string, { reasonFa: string; count: number }>();
+    for (const s of [...skips, ...risks]) {
+      const code = s.rejectionCode ?? "unknown";
+      const cur = byReason.get(code);
+      if (cur) cur.count += 1;
+      else byReason.set(code, { reasonFa: s.rejectionReason ?? code, count: 1 });
+    }
+    return {
+      filled: fills.length,
+      legRisk: risks.length,
+      skipped: skips.length,
+      cashPnlIrtToman: settlements.reduce((s, f) => s + (f.cashPnlIrtToman ?? 0), 0),
+      inventoryDeltaUsdtMicros: settlements.reduce((s, f) => s + (f.inventoryDeltaUsdtMicros ?? 0), 0),
+      sellFeeValueToman: settlements.reduce((s, f) => s + (f.sellFeeValueToman ?? 0), 0),
+      economicNetPnlToman: settlements.reduce((s, f) => s + (f.economicNetPnlToman ?? 0), 0),
+      riskAdjustedPnlToman: settlements.reduce((s, f) => s + (f.riskAdjustedPnlToman ?? 0), 0),
+      feeTomanTotal: settlements.reduce((s, f) => s + (f.feeTomanTotal ?? 0), 0),
+      feeUsdtMicrosTotal: settlements.reduce((s, f) => s + (f.feeUsdtMicrosTotal ?? 0), 0),
+      blockReasons: [...byReason.entries()]
+        .map(([code, v]) => ({ code, reasonFa: v.reasonFa, count: v.count }))
+        .sort((a, b) => b.count - a.count || a.code.localeCompare(b.code)),
+      lastFillAt: fills[0]?.occurredAt ?? null
+    };
+  } catch {
+    return empty;
+  }
+}

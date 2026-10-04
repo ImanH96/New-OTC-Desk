@@ -1,0 +1,37 @@
+# Optional override when this repo is composed from an external parent directory.
+# Example (from /home/server/docker-projects):
+#   docker compose -f docker-compose.yml -f /path/to/iman-otc-desk/docker-compose.production.yml up -d --build
+#
+# Prefer using this repository's docker-compose.yml directly after one-time alignment.
+
+services:
+  iman-otc-desk:
+    environment:
+      # Shadow collector runs inside this web container (single-container design).
+      # Repeated here because production may compose from an external parent file
+      # where this repo's docker-compose.yml is not used.
+      SHADOW_COLLECTOR_ENABLED: "true"
+      SHADOW_POLL_MS: "30000"
+      PRICE_ALERTS_STORAGE: file
+      PRICE_ALERTS_DATA_DIR: /app/data/price-alerts
+      PRICE_ALERTS_DATA_FILE: /app/data/price-alerts/price-alerts.json
+      VIEWER_AUTH_DATA_FILE: /app/data/price-alerts/viewer-auth.json
+      # Never use host.docker.internal for Postgres (Docker Desktop CONNECT_TIMEOUT → 503).
+      OTC_FORCE_COMPOSE_DB: "1"
+      OTC_DB_HOST: otc-postgres
+      OTC_DB_PORT: "5432"
+      # Outbound egress for market data.
+      #
+      # PROXY_HOSTS is a full REPLACEMENT for the built-in list, so a narrow
+      # value silently drops every host it omits — which is how Ramzinex ended
+      # up going direct into a CDN block. It is pinned here, in the override the
+      # production host actually composes with, so the set cannot drift.
+      # OUTBOUND_HTTPS_PROXY stays in the host environment: it carries
+      # credentials and must never be committed.
+      PROXY_HOSTS: ${PROXY_HOSTS:-bonbast.com,navasan.net,ramzinex.com,ramzinex.ir,publicapi.ramzinex.com}
+    volumes:
+      - iman-otc-alerts-data:/app/data/price-alerts
+
+volumes:
+  iman-otc-alerts-data:
+    name: iman-otc-alerts-data

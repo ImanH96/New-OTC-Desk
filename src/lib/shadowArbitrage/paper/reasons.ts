@@ -1,0 +1,281 @@
+/**
+ * Phase 6 / v4.9.1 — exact decision reasons for the paper engine.
+ *
+ * A rejected candidate must always carry the reason the upstream layers already
+ * established. A generic "this was blocked" message is never an acceptable
+ * substitute for a known cause: it destroys the only evidence that makes a
+ * rejection actionable, and it makes every rejection look identical, which is
+ * what turned one cycle into 242 indistinguishable rows.
+ *
+ * Pure module: no database, no network.
+ */
+import type { BlockedReasonCode, OpportunityEligibility } from "@/lib/shadowArbitrage/types";
+
+/** Every reason the paper engine may record. Deliberately specific. */
+export type PaperReasonCode =
+  | "sizing_order_limit"
+  | "delayed_edge_below_floor"
+  | "post_leg_observation_missing"
+  | "delayed_observation_missing"
+  // upstream opportunity state
+  | "account_not_ready"
+  | "fee_unknown"
+  | "fee_stale"
+  | "fee_settlement_unknown"
+  | "fee_settlement_unsupported"
+  | "net_non_positive"
+  | "insufficient_depth"
+  | "reference_only"
+  | "source_unhealthy"
+  | "stale_market_data"
+  | "market_data_missing"
+  | "market_data_unverified"
+  | "market_data_sequence_gap"
+  | "market_data_resync"
+  | "market_data_time_incoherent"
+  | "rate_limited"
+  | "same_venue"
+  // paper-engine state
+  | "mark_price_unavailable"
+  | "rebalance_required_unpriced"
+  | "insufficient_irt"
+  | "insufficient_usdt"
+  | "negative_balance_guard"
+  | "no_balance_record"
+  | "lifecycle_already_processed"
+  | "size_not_selected"
+  | "sizing_blocked" // HISTORICAL ONLY — banned as NEW terminal (use exact sizing_* / inventory / depth codes)
+  | "venue_not_executable"
+  | "portfolio_utilization_cap"
+  | "route_capital_cap"
+  | "venue_exposure_cap"
+  | "inventory_limit"
+  | "reservation_conflict"
+  | "portfolio_not_selected"
+  | "optimizer_budget_exhausted"
+  | "adjusted_score_non_positive"
+  | "experiment_closed"
+  // PAPER-V2 realism / full no-trade closure — exact delayed & sizing codes
+  | "sizing_missing_policy"
+  | "sizing_expired_policy"
+  | "sizing_slippage_over_limit"
+  | "sizing_size_floor"
+  | "sizing_invalid_size"
+  | "portfolio_limits_unavailable"
+  | "delayed_liquidity_disappeared"
+  | "delayed_depth_insufficient"
+  | "delayed_net_non_positive"
+  | "delayed_book_stale"
+  | "delayed_book_incoherent"
+  | "delayed_book_invalid"
+  | "partial_below_minimum"
+  | "leg_risk_second_leg_failed"
+  | "paper_residual_liquidity_exhausted"
+  | "raw_exchange_depth_insufficient";
+
+export const PAPER_REASON_FA: Record<PaperReasonCode, string> = {
+  sizing_order_limit: "حجم معامله از سقف سفارش بیشتر است",
+  delayed_edge_below_floor: "حاشیهٔ پس از تأخیر از کف سیاست کمتر است",
+  post_leg_observation_missing: "مشاهدهٔ پای دوم در دسترس نیست",
+  delayed_observation_missing: "مشاهدهٔ تازه در زمان رسیدن سفارش دریافت نشده است",
+  account_not_ready: "حساب کاربری صرافی آماده نیست",
+  fee_unknown: "کارمزد تأییدنشده",
+  fee_stale: "اعتبار کارمزد منقضی شده است",
+  fee_settlement_unknown: "نحوهٔ تسویهٔ کارمزد (دارایی و سمت) تأیید نشده است",
+  fee_settlement_unsupported: "ترکیب دارایی و نحوهٔ کسر کارمزد برای این سمت معنا ندارد",
+  net_non_positive: "سود خالص اقتصادی پس از کارمزد و بافر مثبت نیست",
+  insufficient_depth: "عمق دفتر برای این حجم کافی نیست",
+  reference_only: "منبع فقط مرجع است و اجراپذیر نیست",
+  source_unhealthy: "منبع ناسالم یا گواهی‌نشده است",
+  stale_market_data: "دادهٔ بازار کهنه است",
+  market_data_missing: "دادهٔ بازار برای این حجم موجود نیست",
+  market_data_unverified: "واحد یا جهت قیمت تأیید نشده است",
+  market_data_sequence_gap: "شکاف توالی دادهٔ بازار؛ snapshot جدید لازم است",
+  market_data_resync: "همگام‌سازی مجدد snapshot هنوز کامل نشده است",
+  market_data_time_incoherent: "زمان رویداد دو سمت مسیر همگام نیست",
+  rate_limited: "محدودیت نرخ درخواست منبع",
+  same_venue: "خرید و فروش روی یک صرافی",
+  mark_price_unavailable: "قیمت مرجع تتر در همین چرخه در دسترس یا تازه نیست",
+  rebalance_required_unpriced:
+    "انتقال/بازتوازن لازم است اما هزینهٔ اقتصادی آن تأیید نشده؛ مسیر بسته می‌ماند",
+  insufficient_irt: "موجودی تومانی صرافی خرید کافی نیست",
+  insufficient_usdt: "موجودی تتری صرافی فروش کافی نیست",
+  negative_balance_guard: "این معامله موجودی را منفی می‌کرد",
+  no_balance_record: "برای این صرافی موجودی مجازی ثبت نشده است",
+  lifecycle_already_processed: "این فرصت قبلاً در همین نشست پردازش شده است",
+  size_not_selected: "حجم بهتری برای همین مسیر انتخاب شد",
+  sizing_blocked: "حجم پویا محاسبه نشد — سیاست ریسک یا شواهد لازم کامل نیست (تاریخی؛ برای رد جدید ممنوع)",
+  venue_not_executable: "صرافی اجراپذیر نیست",
+  portfolio_utilization_cap: "تخصیص از سقف استفادهٔ پرتفوی یا کف نقدینگی آزاد عبور می‌کند",
+  route_capital_cap: "سرمایهٔ ترکیبی مسیر از سقف نسبی سهام تجاوز می‌کند",
+  venue_exposure_cap: "تمرکز سرمایه روی یک صرافی از سقف نسبی سهام تجاوز می‌کند",
+  inventory_limit: "ترکیب انتخابی باند موجودی را نقض می‌کند",
+  reservation_conflict: "ظرفیت شبیه‌سازی‌شده قبلاً برای مسیر دیگری رزرو شده است",
+  portfolio_not_selected: "ترکیب دیگری سود تعدیل‌شدهٔ کل بیشتری دارد",
+  optimizer_budget_exhausted: "بودجهٔ اثبات دقیق تمام شد؛ تخصیص به‌صورت بسته رد شد",
+  adjusted_score_non_positive: "اقتصاد خام مثبت است اما امتیاز موردانتظار Paper مثبت نیست",
+  experiment_closed: "مهلت آزمایش Paper به پایان رسیده — معاملهٔ جدید باز نمی‌شود",
+  sizing_missing_policy: "سیاست ریسک لازم برای اندازه‌گیری حجم تعیین نشده است",
+  sizing_expired_policy: "اعتبار سیاست ریسک لازم برای اندازه‌گیری حجم منقضی شده است",
+  sizing_slippage_over_limit: "بافر لغزش مدل‌شده از سقف مجاز سیاست بیشتر است",
+  sizing_size_floor: "ظرفیت قابل استفاده به حداقل سیاست کاغذی یا حداقل تأییدشدهٔ صرافی نمی‌رسد",
+  sizing_invalid_size: "حجم تخصیص‌یافته از نظر گام/حداقل صرافی یا سیاست نامعتبر است",
+  portfolio_limits_unavailable: "سقف‌های پرتفوی فعال است اما سرمایه یا قیمت مرجع برای اعمال آن‌ها در دسترس نیست",
+  delayed_liquidity_disappeared: "پس از تأخیر شبیه‌سازی‌شده نقدینگی قابل اجرا از بین رفته است",
+  delayed_depth_insufficient: "عمق دفتر تأخیری برای حجم برنامه‌ریزی‌شده کافی نیست",
+  delayed_net_non_positive: "پس از بازبینی دفتر تأخیری سود خالص اقتصادی مثبت نیست",
+  delayed_book_stale: "دفتر تأخیری در زمان رسیدن سفارش کهنه است",
+  delayed_book_incoherent: "هم‌زمانی دریافت دو سمت در زمان رسیدن سفارش خارج از بودجه است",
+  delayed_book_invalid: "دفتر تأخیری نامعتبر است (NaN/متقاطع/سطح خراب)",
+  partial_below_minimum: "عمق تأخیری فقط حجم جزئی زیر حداقل Paper می‌دهد",
+  leg_risk_second_leg_failed: "پای اول در تأخیر قابل اجرا بود اما پای دوم پر نشد — پر کردن اتمی رد شد",
+  paper_residual_liquidity_exhausted: "نقدینگی باقی‌ماندهٔ شبیه‌سازی‌شده در این نشست تمام شده است",
+  raw_exchange_depth_insufficient: "عمق خام دفتر صرافی برای این حجم کافی نیست"
+};
+
+/**
+ * Upstream blocked-reason codes mapped onto paper reasons, one to one where a
+ * distinct cause exists. Nothing collapses into a catch-all.
+ */
+const FROM_UPSTREAM: Record<BlockedReasonCode, PaperReasonCode> = {
+  fee_unknown: "fee_unknown",
+  stale_buy_source: "stale_market_data",
+  stale_sell_source: "stale_market_data",
+  insufficient_buy_depth: "insufficient_depth",
+  insufficient_sell_depth: "insufficient_depth",
+  account_required: "account_not_ready",
+  reference_only: "reference_only",
+  source_unhealthy: "source_unhealthy",
+  quote_direction_unverified: "market_data_unverified",
+  market_data_missing: "market_data_missing",
+  same_venue: "same_venue",
+  non_positive_net: "net_non_positive",
+  depth_unverified: "insufficient_depth",
+  quote_max_unverified: "insufficient_depth",
+  units_ambiguous: "market_data_unverified",
+  rate_limited: "rate_limited",
+  sequence_gap: "market_data_sequence_gap",
+  snapshot_resync: "market_data_resync",
+  incoherent_event_time: "market_data_time_incoherent",
+  source_not_certified: "source_unhealthy"
+};
+
+/**
+ * Priority when a candidate carries several reasons at once.
+ *
+ * The primary reason is the most fundamental one — the thing that must be fixed
+ * first. Ordering is fixed so the same set of causes always yields the same
+ * primary, which is what keeps the compact per-cycle counts stable.
+ */
+const PRIORITY: PaperReasonCode[] = [
+  "delayed_edge_below_floor",
+  "post_leg_observation_missing",
+  "delayed_observation_missing",
+  "same_venue",
+  "reference_only",
+  "account_not_ready",
+  "venue_not_executable",
+  "fee_unknown",
+  "fee_stale",
+  "fee_settlement_unknown",
+  "fee_settlement_unsupported",
+  "source_unhealthy",
+  "rate_limited",
+  "stale_market_data",
+  "market_data_sequence_gap",
+  "market_data_resync",
+  "market_data_time_incoherent",
+  "market_data_missing",
+  "market_data_unverified",
+  "paper_residual_liquidity_exhausted",
+  "raw_exchange_depth_insufficient",
+  "insufficient_depth",
+  "mark_price_unavailable",
+  "net_non_positive",
+  "rebalance_required_unpriced",
+  "insufficient_irt",
+  "insufficient_usdt",
+  "negative_balance_guard",
+  "no_balance_record",
+  "lifecycle_already_processed",
+  "experiment_closed",
+  "portfolio_utilization_cap",
+  "route_capital_cap",
+  "venue_exposure_cap",
+  "inventory_limit",
+  "reservation_conflict",
+  "optimizer_budget_exhausted",
+  "adjusted_score_non_positive",
+  "portfolio_not_selected",
+  "sizing_missing_policy",
+  "sizing_expired_policy",
+  "sizing_slippage_over_limit",
+  "sizing_size_floor",
+  "sizing_invalid_size",
+  "portfolio_limits_unavailable",
+  "delayed_liquidity_disappeared",
+  "delayed_depth_insufficient",
+  "delayed_net_non_positive",
+  "delayed_book_stale",
+  "delayed_book_incoherent",
+  "delayed_book_invalid",
+  "partial_below_minimum",
+  "leg_risk_second_leg_failed",
+  "sizing_blocked",
+  "size_not_selected"
+];
+
+const PRIORITY_INDEX = new Map(PRIORITY.map((code, i) => [code, i]));
+
+/** Deterministic primary reason from a set. Never returns a generic value. */
+export function primaryReason(codes: PaperReasonCode[]): PaperReasonCode {
+  if (!codes.length) throw new Error("primaryReason requires at least one reason");
+  return [...codes].sort(
+    (a, b) => (PRIORITY_INDEX.get(a) ?? 999) - (PRIORITY_INDEX.get(b) ?? 999) || a.localeCompare(b)
+  )[0];
+}
+
+/** Sorted, de-duplicated reason list — the canonical form stored and compared. */
+export function normalizeReasons(codes: PaperReasonCode[]): PaperReasonCode[] {
+  return [...new Set(codes)].sort(
+    (a, b) => (PRIORITY_INDEX.get(a) ?? 999) - (PRIORITY_INDEX.get(b) ?? 999) || a.localeCompare(b)
+  );
+}
+
+/**
+ * Translate an opportunity's own state into exact paper reasons.
+ * `feeStale` comes from Phase 4 readiness, which the opportunity does not carry.
+ */
+export function reasonsFromOpportunity(input: {
+  eligibility: OpportunityEligibility;
+  blockedReasons: BlockedReasonCode[];
+  feeUnknown: boolean;
+  buyFeeStale?: boolean;
+  sellFeeStale?: boolean;
+}): PaperReasonCode[] {
+  const out: PaperReasonCode[] = [];
+  for (const r of input.blockedReasons ?? []) {
+    const mapped = FROM_UPSTREAM[r];
+    if (mapped) out.push(mapped);
+  }
+  if (input.eligibility === "REFERENCE_ONLY") out.push("reference_only");
+  if (input.eligibility === "ACCOUNT_REQUIRED") out.push("account_not_ready");
+  if (input.feeUnknown) out.push("fee_unknown");
+  if (input.buyFeeStale || input.sellFeeStale) out.push("fee_stale");
+  return normalizeReasons(out);
+}
+
+/** Stable key for "has this candidate's decision changed since last cycle?". */
+export function reasonKey(outcome: string, codes: PaperReasonCode[]): string {
+  return `${outcome}:${normalizeReasons(codes).join(",")}`;
+}
+
+export function reasonLabel(code: string): string {
+  return PAPER_REASON_FA[code as PaperReasonCode] ?? code;
+}
+
+/** Banned as the sole NEW terminal reason (historical rows may still carry these). */
+export function isBannedTerminalReason(code: string | null | undefined): boolean {
+  if (code == null || code === "" || code === "unknown") return true;
+  return code === "sizing_blocked";
+}

@@ -1,0 +1,15 @@
+node_modules
+.next
+.docker-export
+.git
+.data
+app/data
+*.log
+.env
+.env.*
+!.env.example
+.DS_Store
+tsconfig.tsbuildinfo
+coverage
+*.md
+!docs/DOCKER-DEPLOYMENT.md

@@ -1,0 +1,1796 @@
+import { NextResponse } from "next/server";
+import { isSession } from "@/lib/requireApiAuth";
+import { requireAdminSession } from "@/lib/requireAdmin";
+import {
+  getObservation,
+  loadLatestCapitalApproval,
+  loadLatestCapitalPlan,
+  loadLatestAccountConfirmations,
+  loadLatestSourceSnapshots,
+  runSerialized
+} from "@/db/repositories/shadowArbitrage";
+import {
+  createPaperSession,
+  getActivePaperSession,
+  getPaperSession,
+  isUnresolvedLegRiskError,
+  listPaperSessions,
+  listUnresolvedLegRiskRows,
+  loadCandidateStates,
+  loadCycleSummaries,
+  countPaperLedger,
+  loadPaperBalances,
+  loadPaperLedger,
+  loadPaperStats,
+  loadReasonBreakdown,
+  reconcilePaperLegRisk,
+  setPaperSessionStatus,
+  type PaperSessionMode
+} from "@/db/repositories/shadowPaper";
+import { buildAllReadiness } from "@/lib/shadowArbitrage/accounts";
+import {
+  validateAllocation,
+  type VenueAllocation
+} from "@/lib/shadowArbitrage/paper/portfolio";
+import {
+  buildPortfolioAccounting,
+  tehranDayStartMs,
+  type AccountingFill
+} from "@/lib/shadowArbitrage/paper/accounting";
+import { buildVenueDepthCard } from "@/lib/shadowArbitrage/paper/venueDepthView";
+import {
+  DEFAULT_CAPITAL_TOMAN,
+  buildOptimizedPlan,
+  classifyAllVenues,
+  evaluateRecommendation,
+  planFingerprint,
+  readinessFingerprint,
+  type CapitalPlanInput
+} from "@/lib/shadowArbitrage/capital";
+import { SHADOW_BANNER, SHADOW_SOURCES, SHADOW_TRADE_SIZES, SLIPPAGE_BUFFER_BPS } from "@/lib/shadowArbitrage/config";
+import { loadEffectiveFees } from "@/lib/shadowArbitrage/effectiveFees";
+import { loadRiskPolicyValues } from "@/db/repositories/shadowLive";
+import { loadLastMatrix } from "@/lib/shadowArbitrage/store";
+import { buildPolicyState } from "@/lib/shadowArbitrage/live/policy";
+import {
+  computeAllRouteSizes,
+  BASELINE_FIXED_SIZES_USDT,
+  CANDIDATE_PERCENTS,
+  CAPITAL_CAP_PERCENT,
+  DEPTH_CAP_PERCENT,
+  LEDGER_SIZE_QUANTUM_MICROS,
+  PAPER_POLICY_MIN_KEY,
+  PAPER_POLICY_MIN_USDT,
+  SIZING_REQUIRED_POLICIES,
+  SMART_SIZING_POLICY
+} from "@/lib/shadowArbitrage/paper/sizing";
+import { listVenueExecutionLimits } from "@/lib/shadowArbitrage/paper/venueExecutionLimits";
+import {
+  assessInventory,
+  targetsFromAllocations,
+  type InventoryModel
+} from "@/lib/shadowArbitrage/paper/inventory";
+import { venueCapacity, type QuoteCapacityInput } from "@/lib/shadowArbitrage/paper/liquidity";
+import {
+  applyProposal,
+  allocationBooksFingerprint,
+  allocationFeesFingerprint,
+  fingerprint,
+  listDecisions,
+  listProposals,
+  recordProposal,
+  type Fingerprints
+} from "@/db/repositories/shadowAllocation";
+import {
+  buildLiquidityAwarePlan,
+  type RouteObservation
+} from "@/lib/shadowArbitrage/paper/allocation";
+import type { ShadowSourceId } from "@/lib/shadowArbitrage/types";
+import { SHADOW_NO_STORE } from "@/lib/shadowArbitrage/httpHeaders";
+import { PAPER_FEE_SETTLEMENT, microsToUsdt, settlementFor, usdtToMicros } from "@/lib/shadowArbitrage/paper/broker";
+import { parseSessionSetupNote } from "@/lib/shadowArbitrage/paper/sessionCapital";
+import { allocatePaperRoutes } from "@/lib/shadowArbitrage/paper/portfolioAllocator";
+import {
+  PAPER_PORTFOLIO_FAILSAFE_VENUE_PERCENT,
+  PAPER_PORTFOLIO_MAX_UTILIZATION_PERCENT,
+  PAPER_PORTFOLIO_MIN_RESERVE_PERCENT
+} from "@/lib/shadowArbitrage/paper/experimentPolicy";
+
+export const dynamic = "force-dynamic";
+export const runtime = "nodejs";
+
+/**
+ * Phase 6 — admin-only paper execution control surface.
+ *
+ * Paper trading only. This endpoint creates and controls a SIMULATED session:
+ * it has no exchange client, accepts no credentials, and contains no code path
+ * that can place an order or move funds. Every balance it reports is virtual.
+ */
+
+// Route files may only export Next.js route fields, so these stay module-local.
+const PAPER_BANNER_FA = "اجرای کاغذی — بدون سفارش واقعی و بدون انتقال وجه";
+const PAPER_BANNER_EN = "PAPER EXECUTION — NO REAL ORDERS OR TRANSFERS";
+
+/** Any of these in a request body is an immediate refusal. */
+const FORBIDDEN_FIELDS = [
+  "apiKey",
+  "api_key",
+  "secret",
+  "apiSecret",
+  "token",
+  "password",
+  "passphrase",
+  "privateKey",
+  "mnemonic"
+];
+
+const VALID_IDS = new Set<string>(SHADOW_SOURCES.map((s) => s.id));
+
+function durationDaysFromIso(
+  startedAt: string | null | undefined,
+  endsAt: string | null | undefined
+): number | null {
+  if (!startedAt || !endsAt) return null;
+  const a = Date.parse(startedAt);
+  const b = Date.parse(endsAt);
+  if (!Number.isFinite(a) || !Number.isFinite(b) || b <= a) return null;
+  const days = Math.round((b - a) / 86_400_000);
+  return days > 0 ? days : null;
+}
+
+function summaryNum(summary: Record<string, unknown> | null | undefined, key: string): number | null {
+  if (!summary) return null;
+  const v = summary[key];
+  if (typeof v === "number" && Number.isFinite(v)) return v;
+  if (typeof v === "string" && v.trim() !== "") {
+    const n = Number(v);
+    return Number.isFinite(n) ? n : null;
+  }
+  return null;
+}
+
+function operatorStatusFa(sessionStatus?: string | null, experimentStatus?: string | null): string {
+  const s = (sessionStatus ?? "").toUpperCase();
+  if (s === "RUNNING") return "running";
+  if (s === "PAUSED") return "paused";
+  if (s === "STOPPED") return (experimentStatus ?? "").toUpperCase() === "COMPLETED" ? "completed" : "stopped";
+  const e = (experimentStatus ?? "").toUpperCase();
+  if (e === "ACTIVE") return "running";
+  if (e === "COMPLETED") return "completed";
+  if (e === "SUPERSEDED") return "stopped";
+  if (e === "PENDING") return "paused";
+  if (s === "NOT_STARTED" || s === "CREATED") return "stopped";
+  return "unknown";
+}
+
+function bad(message: string, error = "bad_request", status = 400) {
+  return new NextResponse(JSON.stringify({ error, message }), {
+    status,
+    headers: SHADOW_NO_STORE
+  });
+}
+
+/** Median mid-price across venues that reported both sides this cycle. */
+function deriveValuationPrice(
+  snapshots: Array<{ userBuy: number | null; userSell: number | null; stale: boolean }>
+): number | null {
+  const mids = snapshots
+    .filter((s) => !s.stale && s.userBuy !== null && s.userSell !== null)
+    .map((s) => ((s.userBuy as number) + (s.userSell as number)) / 2)
+    .filter((n) => Number.isFinite(n) && n > 0)
+    .sort((a, b) => a - b);
+  if (!mids.length) return null;
+  const mid = Math.floor(mids.length / 2);
+  return Math.round(mids.length % 2 ? mids[mid] : (mids[mid - 1] + mids[mid]) / 2);
+}
+
+async function snapshot(reasonFilter: string | null = null) {
+  const session = await getActivePaperSession();
+  if (!session) {
+    return {
+      session: null,
+      balances: [],
+      trades: [],
+      legRisks: [],
+      transitions: [],
+      candidates: [],
+      reasonBreakdown: [],
+      cycleSummaries: [],
+      stats: null,
+      accounting: null
+    };
+  }
+  const [balances, trades, transitions, stats, reasonBreakdown, candidates, cycleSummaries, legRisks] =
+    await Promise.all([
+      loadPaperBalances(session.id),
+      // Financial history is append-only and must not be capped by opportunity retention.
+      loadPaperLedger(session.id, { outcome: "FILLED", limit: 2_000 }),
+      // Only state transitions are stored now, so this list is already compact.
+      loadPaperLedger(session.id, { outcome: "SKIPPED", limit: 200 }),
+      loadPaperStats(session.id),
+      loadReasonBreakdown(session.id),
+      loadCandidateStates(session.id, {
+        reason: reasonFilter ?? undefined,
+        openOnly: true,
+        limit: 200
+      }),
+      loadCycleSummaries(session.id, 60),
+      loadPaperLedger(session.id, {outcome:"LEG_RISK",limit:2000})
+    ]);
+
+  // Inventory drift: where the virtual book stands versus how it opened.
+  const opening = new Map(
+    session.openingAllocations.map((a) => [
+      a.sourceId,
+      { irtToman: Math.round(a.irtToman), usdtMicros: Math.round(a.usdtUnits * 1_000_000) }
+    ])
+  );
+  const drift = balances.map((b) => {
+    const o = opening.get(b.sourceId) ?? { irtToman: 0, usdtMicros: 0 };
+    return {
+      sourceId: b.sourceId,
+      irtTomanDelta: b.irtToman - o.irtToman,
+      usdtDelta: microsToUsdt(b.usdtMicros - o.usdtMicros)
+    };
+  });
+
+  const evaluated = stats.filled + stats.skipped + stats.legRisk;
+  return {
+    session,
+    balances: balances.map((b) => {
+      // Settlement is reported per side, never collapsed into one currency.
+      const st = PAPER_FEE_SETTLEMENT[b.sourceId as keyof typeof PAPER_FEE_SETTLEMENT];
+      return {
+        sourceId: b.sourceId,
+        irtToman: b.irtToman,
+        usdt: microsToUsdt(b.usdtMicros),
+        usdtMicros: b.usdtMicros,
+        buySettlement: st?.buy ?? { feeAsset: "UNKNOWN", debitMode: "UNKNOWN", provenance: "UNKNOWN" },
+        sellSettlement: st?.sell ?? { feeAsset: "UNKNOWN", debitMode: "UNKNOWN", provenance: "UNKNOWN" }
+      };
+    }),
+    trades,
+    legRisks,
+    transitions,
+    candidates,
+    reasonBreakdown,
+    cycleSummaries,
+    stats: {
+      ...stats,
+      feeUsdtTotal: microsToUsdt(stats.feeUsdtMicrosTotal),
+      /** Filled ÷ every candidate the engine considered. */
+      opportunityCaptureRatePercent:
+        evaluated > 0 ? Math.round((stats.filled / evaluated) * 10_000) / 100 : null,
+      drift
+    },
+    /**
+     * Built later in GET once the mark price is known. Placeholder so callers
+     * always see the key even when the session is empty.
+     */
+    accounting: null as unknown
+  };
+}
+
+/** Minimal current-state read for operators; deliberately excludes aggregates/history. */
+async function operatorSnapshot() {
+  // On PGlite a collector cycle owns the serialization queue. Acquire it once
+  // for the complete operator sample: five independent queue entries could be
+  // interleaved with five network cycles and look like a hung API.
+  return runSerialized(async () => {
+    const session = await getActivePaperSession();
+    if (!session) {
+      return {
+        session: null, balances: [], trades: [], legRisks: [], transitions: [], candidates: [],
+        reasonBreakdown: [], cycleSummaries: [], stats: null, accounting: null
+      };
+    }
+    // One newest-ledger query is enough for the operator view. Reading each
+    // outcome separately made this supposedly small endpoint perform five DB
+    // reads and could leave it waiting behind a busy PGlite collector cycle.
+    const [latestRows, cycleSummaries] = await Promise.all([
+      loadPaperLedger(session.id, { limit: 1 }),
+      loadCycleSummaries(session.id, 1)
+    ]);
+    const latest = latestRows[0] ?? null;
+    const trades = latest?.outcome === "FILLED" ? [latest] : [];
+    const transitions = latest?.outcome === "SKIPPED" ? [latest] : [];
+    const legRisks = latest?.outcome === "LEG_RISK" ? [latest] : [];
+    return {
+      session,
+      balances: [],
+      trades,
+      legRisks,
+      transitions,
+      candidates: [],
+      reasonBreakdown: [],
+      cycleSummaries,
+      stats: null,
+      accounting: null
+    };
+  });
+}
+
+function envelope(extra: Record<string, unknown>) {
+  return {
+    banner: SHADOW_BANNER,
+    paperBanner: PAPER_BANNER_EN,
+    paperBannerFa: PAPER_BANNER_FA,
+    shadowMode: true,
+    paperOnly: true,
+    realOrders: false,
+    serverNow: new Date().toISOString(),
+    ...extra
+  };
+}
+
+/**
+ * Everything both allocation actions need, derived once from live evidence.
+ *
+ * The fingerprints are taken here so a proposal and a later apply are compared
+ * against the same four facts — books, fees, account evidence and the policy
+ * caps. Any drift between them makes the proposal stale, which is what stops an
+ * allocation computed against a market that no longer exists from being applied.
+ */
+async function buildAllocationContext(): Promise<
+  | { ok: false; messageFa: string }
+  | {
+      ok: true;
+      totalCapitalToman: number;
+      valuationPriceToman: number;
+      venueIds: string[];
+      observations: RouteObservation[];
+      capacityBySource: Map<string, ReturnType<typeof venueCapacity>>;
+      fingerprints: Fingerprints;
+      appliedPolicyCaps: Record<string, number>;
+      unsetPolicyCaps: string[];
+      sessionId: string | null;
+    }
+> {
+  const [snap, lastMatrix, fees, accounts, policyValues] = await Promise.all([
+    snapshot(null),
+    loadLastMatrix(),
+    loadEffectiveFees(Date.now()),
+    loadLatestAccountConfirmations(),
+    loadRiskPolicyValues()
+  ]);
+
+  const readiness = buildAllReadiness(
+    fees.overrides,
+    Date.now(),
+    Object.values(accounts),
+    fees.blocks
+  );
+  const venues = classifyAllVenues(readiness).filter((v) => v.executable);
+  if (!venues.length) return { ok: false, messageFa: "هیچ صرافی اجراپذیری وجود ندارد." };
+
+  const sources = lastMatrix?.sources ?? [];
+  const snapshotById = new Map(sources.map((x) => [x.sourceId as string, x]));
+  const price =
+    snap.session?.valuationPriceToman ??
+    deriveValuationPrice(await loadLatestSourceSnapshots());
+  if (!price || price <= 0) {
+    return { ok: false, messageFa: "قیمت مبنای تتر در دسترس نیست؛ بدون آن تخصیص انجام نمی‌شود." };
+  }
+
+  const total = snap.session?.totalCapitalToman ?? DEFAULT_CAPITAL_TOMAN;
+  const balances = (snap.balances ?? []).map((b) => ({
+    sourceId: b.sourceId,
+    irtToman: b.irtToman,
+    usdtMicros: usdtToMicros(b.usdt)
+  }));
+  const shareBySource = new Map<string, number>(
+    (snap.session?.openingAllocations ?? []).map((a) => [
+      a.sourceId as string,
+      Math.round(a.irtToman + a.usdtUnits * price)
+    ])
+  );
+
+  const policies = buildPolicyState(policyValues);
+  const orderSize = policies.find((p) => p.definition.key === "max_order_size_usdt");
+  const orderSizeMicros = orderSize?.configured ? usdtToMicros(orderSize.value as number) : null;
+
+  const capacityBySource = new Map<string, ReturnType<typeof venueCapacity>>();
+  for (const v of venues) {
+    const sn = snapshotById.get(v.sourceId);
+    const bal = balances.find((b) => b.sourceId === v.sourceId);
+    capacityBySource.set(
+      v.sourceId,
+      venueCapacity({
+        sourceId: v.sourceId,
+        marketModel: sn?.marketModel ?? "ORDER_BOOK",
+        bookBids: sn?.bookBids ?? null,
+        bookAsks: sn?.bookAsks ?? null,
+        // Why the book is absent, not merely that it is.
+        sourceFailureFa: sn?.errorReason ?? sn?.degradedReason ?? null,
+        irtToman: bal?.irtToman ?? null,
+        usdtMicros: bal?.usdtMicros ?? null,
+        feeBps: readiness.find((r) => r.sourceId === v.sourceId)?.takerFeeBps ?? null,
+        buyFeeAsset: settlementFor(v.sourceId as ShadowSourceId, "buy").feeAsset,
+        sellFeeAsset: settlementFor(v.sourceId as ShadowSourceId, "sell").feeAsset,
+        capitalShareToman: shareBySource.get(v.sourceId) ?? null,
+        policyOrderSizeMicros: orderSizeMicros,
+        policyExposureMicros: null
+      })
+    );
+  }
+
+  /*
+   * Observations drive the role split. Only FILLED history is used — a route
+   * the desk actually captured profit on is evidence; a route that merely
+   * looked good is not.
+   */
+  const byRoute = new Map<string, RouteObservation>();
+  for (const t of snap.trades ?? []) {
+    const key = `${t.buySourceId}->${t.sellSourceId}`;
+    const prev = byRoute.get(key);
+    const pnl = Number(t.riskAdjustedPnlToman ?? 0);
+    if (prev) {
+      prev.occurrences += 1;
+      prev.riskAdjustedPnlToman += pnl;
+    } else {
+      byRoute.set(key, {
+        buySourceId: t.buySourceId,
+        sellSourceId: t.sellSourceId,
+        occurrences: 1,
+        riskAdjustedPnlToman: pnl,
+        capacityUsdtMicros: capacityBySource.get(t.buySourceId)?.buy.capacityUsdtMicros ?? 0
+      });
+    }
+  }
+
+  const appliedPolicyCaps: Record<string, number> = {};
+  const unsetPolicyCaps: string[] = [];
+  for (const p of policies) {
+    if (p.configured && p.value !== null) appliedPolicyCaps[p.definition.key] = p.value;
+    else unsetPolicyCaps.push(p.definition.key);
+  }
+
+  return {
+    ok: true,
+    totalCapitalToman: total,
+    valuationPriceToman: price,
+    venueIds: venues.map((v) => v.sourceId),
+    observations: [...byRoute.values()].sort((a, b) =>
+      `${a.buySourceId}->${a.sellSourceId}`.localeCompare(`${b.buySourceId}->${b.sellSourceId}`)
+    ),
+    capacityBySource,
+    fingerprints: {
+      books: allocationBooksFingerprint(sources as unknown as Array<Record<string, unknown>>),
+      fees: allocationFeesFingerprint(fees as unknown as {
+        venues?: Array<Record<string, unknown>>;
+        blocks?: Array<Record<string, unknown>>;
+      }),
+      accounts: fingerprint(accounts),
+      policy: fingerprint({ applied: appliedPolicyCaps, unset: [...unsetPolicyCaps].sort() })
+    },
+    appliedPolicyCaps,
+    unsetPolicyCaps,
+    sessionId: snap.session?.id ?? null
+  };
+}
+
+export async function GET(request: Request) {
+  const session = await requireAdminSession();
+  if (!isSession(session)) return session;
+
+  // Optional server-side filter so a large session never ships every candidate.
+  const requestUrl = new URL(request.url);
+  const reason = requestUrl.searchParams.get("reason");
+  const requestedView = requestUrl.searchParams.get("view");
+  const operatorView = requestedView === "operator" || requestedView === "control";
+  const operatorControl = requestedView === "control";
+  const [snap, history] = await Promise.all([
+    operatorView ? operatorSnapshot() : snapshot(reason),
+    operatorView ? Promise.resolve([]) : listPaperSessions(20)
+  ]);
+  if (operatorView) {
+    const latestDecision = [...snap.trades, ...snap.transitions, ...snap.legRisks]
+      .sort((a, b) => Date.parse(b.occurredAt) - Date.parse(a.occurredAt))[0] ?? null;
+    const audit = latestDecision?.sizingAudit ?? null;
+    const safeMaxMicros =
+      typeof audit?.maxFeasibleUsdtMicros === "number"
+        ? audit.maxFeasibleUsdtMicros
+        : latestDecision?.limitingUsableUsdtMicros ?? null;
+    if (operatorControl) {
+      const status = snap.session?.status ?? "NONE";
+      const action = status === "RUNNING" ? "pause" : status === "PAUSED" ? "resume" : null;
+      const label = action === "pause" ? "Pause Paper safely" : action === "resume" ? "Resume Paper" : "No controllable session";
+      const sessionId = snap.session?.id ?? "";
+      return new NextResponse(
+        `<!doctype html><html><head><meta charset="utf-8"><title>Shadow Paper control</title></head><body>` +
+          `<h1>Shadow Paper control</h1><p>LIVE=false · PAPER/DISARMED</p>` +
+          `<p>Session: ${sessionId}</p><p>Status: <strong>${status}</strong></p>` +
+          (action
+            ? `<form method="post"><input type="hidden" name="action" value="${action}">` +
+              `<input type="hidden" name="sessionId" value="${sessionId}">` +
+              `<button type="submit">${label}</button></form>`
+            : `<button disabled>${label}</button>`) +
+          `</body></html>`,
+        { status: 200, headers: { ...SHADOW_NO_STORE, "content-type": "text/html; charset=utf-8" } }
+      );
+    }
+    return new NextResponse(
+      JSON.stringify(
+        envelope({
+          ...snap,
+          sessionHistory: history,
+          sizing: { routes: [] },
+          operational: {
+            currentCycle: snap.cycleSummaries[0] ?? null,
+            latestDecision,
+            sizingWaterfall: audit?.waterfall ?? null,
+            safeMaxUsdt: safeMaxMicros === null ? null : microsToUsdt(safeMaxMicros),
+            selectedSizeUsdt: latestDecision?.sizeUsdt ?? null,
+            terminalReason:
+              latestDecision?.rejectionCode ?? latestDecision?.outcome ?? null
+          },
+          typedIdentity: {
+            paperSessionId: snap.session?.id ?? null,
+            paperSessionStatus: snap.session?.status ?? null,
+            observationId: snap.session?.observationId ?? null,
+            experimentId: snap.session?.experimentRunId ?? null,
+            collectorRunId: latestDecision?.runId ?? null,
+            deploymentVersion: null
+          }
+        })
+      ),
+      { status: 200, headers: SHADOW_NO_STORE }
+    );
+  }
+  /*
+   * The wizard needs two facts it must not invent: today's mark price and which
+   * venues may hold capital. Both are derived here, on the server, from the same
+   * evidence the engine uses.
+   */
+  const [wizardSnapshots, wizardFees, wizardAccounts, latestPlan] = await Promise.all([
+    loadLatestSourceSnapshots(),
+    loadEffectiveFees(Date.now()),
+    loadLatestAccountConfirmations(),
+    loadLatestCapitalPlan()
+  ]);
+  const wizardReadiness = buildAllReadiness(
+    wizardFees.overrides,
+    Date.now(),
+    Object.values(wizardAccounts),
+    wizardFees.blocks
+  );
+  const wizard = {
+    markPriceToman: deriveValuationPrice(wizardSnapshots),
+    eligibleVenues: classifyAllVenues(wizardReadiness)
+      .filter((v) => v.executable)
+      .map((v) => ({ sourceId: v.sourceId, nameFa: v.nameFa })),
+    capitalPlan: latestPlan
+      ? {
+          id: latestPlan.id,
+          name: latestPlan.name,
+          totalCapitalToman: latestPlan.totalCapitalToman,
+          createdAt: latestPlan.createdAt,
+          allocations: latestPlan.allocations
+        }
+      : null
+  };
+
+  /*
+   * Phase 8C-3 — the dynamic size, recomputed read-only for every eligible
+   * route so the screen can show what would trade right now and, when nothing
+   * would, exactly which policy or piece of evidence is missing. Same pure
+   * function the engine uses; this endpoint still cannot trade.
+   */
+  const [policyValues, lastMatrix] = await Promise.all([loadRiskPolicyValues(), loadLastMatrix()]);
+  const policies = buildPolicyState(policyValues);
+  // Normalized snapshots — the same cached cycle the matrix serves, so the size
+  // shown here is computed from exactly the evidence the engine last saw.
+  const snapshotById = new Map((lastMatrix?.sources ?? []).map((s) => [s.sourceId as string, s]));
+  const feeBpsById = new Map<string, number | null>(
+    Object.values(wizardReadiness).map((r) => [r.sourceId as string, r.takerFeeBps ?? null])
+  );
+  const sizingBalances = (snap.balances ?? []).map((b) => ({
+    sourceId: b.sourceId as ShadowSourceId,
+    irtToman: b.irtToman,
+    usdtMicros: usdtToMicros(b.usdt)
+  }));
+  const valuationPriceToman = snap.session?.valuationPriceToman ?? null;
+  const exposureTomanBySource = new Map<string, number>();
+  const allocationTomanBySource = new Map<string, number>();
+  if (valuationPriceToman !== null && valuationPriceToman > 0) {
+    for (const b of sizingBalances) {
+      exposureTomanBySource.set(
+        b.sourceId as string,
+        b.irtToman + Math.round(microsToUsdt(b.usdtMicros) * valuationPriceToman)
+      );
+    }
+    for (const a of snap.session?.openingAllocations ?? []) {
+      allocationTomanBySource.set(
+        a.sourceId as string,
+        Math.round(a.irtToman + a.usdtUnits * valuationPriceToman)
+      );
+    }
+  }
+  const portfolioValueToman = exposureTomanBySource.size
+    ? [...exposureTomanBySource.values()].reduce((s, v) => s + v, 0)
+    : null;
+
+  /*
+   * Phase 8C-5 — per-venue capacity, answered independently for every venue so
+   * two unrelated causes can never be reported as one. An OTC dealer that
+   * publishes no ladder and a book venue that missed a cycle are different
+   * facts with different operator actions.
+   */
+  const maxQuoteAgePolicy = policies.find((p) => p.definition.key === "max_quote_age_ms");
+  const maxQuoteAgeMsPolicy = maxQuoteAgePolicy?.configured
+    ? ((maxQuoteAgePolicy.value as number) ?? null)
+    : null;
+  const policyOrderSizeUsdt = policies.find((p) => p.definition.key === "max_order_size_usdt");
+  const policyOrderSizeMicros = policyOrderSizeUsdt?.configured
+    ? usdtToMicros(policyOrderSizeUsdt.value as number)
+    : null;
+
+  const venueCapacities = wizard.eligibleVenues.map((v) => {
+    const snapshot = snapshotById.get(v.sourceId);
+    const balance = sizingBalances.find((b) => (b.sourceId as string) === v.sourceId);
+    return {
+      ...venueCapacity({
+        sourceId: v.sourceId,
+        marketModel: snapshot?.marketModel ?? "ORDER_BOOK",
+        bookBids: snapshot?.bookBids ?? null,
+        bookAsks: snapshot?.bookAsks ?? null,
+        sourceFailureFa: snapshot?.errorReason ?? snapshot?.degradedReason ?? null,
+        irtToman: balance?.irtToman ?? null,
+        usdtMicros: balance?.usdtMicros ?? null,
+        feeBps: feeBpsById.get(v.sourceId) ?? null,
+        buyFeeAsset: settlementFor(v.sourceId as ShadowSourceId, "buy").feeAsset,
+        sellFeeAsset: settlementFor(v.sourceId as ShadowSourceId, "sell").feeAsset,
+        capitalShareToman: allocationTomanBySource.get(v.sourceId) ?? null,
+        policyOrderSizeMicros,
+        // Exposure is a portfolio-level ceiling, not a per-venue one; it is
+        // applied per route where the current exposure is known.
+        policyExposureMicros: null,
+        // Order-book venues leave this undefined; a dealer is measured from it.
+        quote:
+          snapshot?.marketModel === "OTC_QUOTE"
+            ? {
+                userBuyPriceToman: snapshot.userBuyPriceToman,
+                userSellPriceToman: snapshot.userSellPriceToman,
+                maxExecutableUsdt: snapshot.maxExecutableUsdt,
+                ageMs: snapshot.ageMs,
+                stale: snapshot.stale,
+                maxQuoteAgeMs: maxQuoteAgeMsPolicy
+              }
+            : undefined
+      }),
+      nameFa: v.nameFa
+    };
+  });
+
+  // Allocation roles belong to the full planning/reporting view. The compact
+  // operator read must not wait on the proposal store merely to show current
+  // execution state.
+  const latestProposalRows = operatorView
+    ? []
+    : (((await listProposals(1))[0]?.rows as
+        | Array<{ sourceId: string; role: string }>
+        | undefined) ?? []);
+
+  /** Dealer quotes, built once and shared by capacity and route sizing. */
+  const quoteBySource = new Map<string, QuoteCapacityInput>();
+  for (const v of wizard.eligibleVenues) {
+    const sn = snapshotById.get(v.sourceId);
+    if (sn?.marketModel !== "OTC_QUOTE") continue;
+    quoteBySource.set(v.sourceId, {
+      userBuyPriceToman: sn.userBuyPriceToman,
+      userSellPriceToman: sn.userSellPriceToman,
+      maxExecutableUsdt: sn.maxExecutableUsdt,
+      ageMs: sn.ageMs,
+      stale: sn.stale,
+      maxQuoteAgeMs: maxQuoteAgeMsPolicy
+    });
+  }
+
+  /*
+   * The inventory band, read exactly as the engine reads it: targets from the
+   * session's own opening allocations, band from the admin policy. An unset
+   * policy leaves it null so the screen shows the same fail-closed answer the
+   * engine would give, rather than a size the engine would refuse.
+   */
+  const inventoryDeviationPolicy = policies.find(
+    (p) => p.definition.key === "max_inventory_deviation_percent"
+  );
+  const inventoryModel: InventoryModel = {
+    valuationPriceToman,
+    targets:
+      valuationPriceToman !== null && valuationPriceToman > 0
+        ? targetsFromAllocations(snap.session?.openingAllocations ?? [], valuationPriceToman)
+        : [],
+    maxDeviationPoints: inventoryDeviationPolicy?.configured
+      ? ((inventoryDeviationPolicy.value as number) ?? null)
+      : null
+  };
+
+  const sizingRoutes = computeAllRouteSizes({
+    venueIds: wizard.eligibleVenues.map((v) => v.sourceId),
+    snapshotById,
+    feeBpsById,
+    settlementFor: (id, side) => settlementFor(id as ShadowSourceId, side),
+    balances: sizingBalances,
+    allocationTomanBySource,
+    portfolioValueToman,
+    exposureTomanBySource,
+    policies,
+    slippageBufferBps: SLIPPAGE_BUFFER_BPS,
+    inventoryModel,
+    quoteBySource
+  });
+  const portfolioAllocation =
+    valuationPriceToman !== null &&
+    valuationPriceToman > 0 &&
+    snap.session &&
+    sizingBalances.length
+      ? allocatePaperRoutes({
+          candidates: sizingRoutes.flatMap((route) => {
+            const sized = route.sizing;
+            if (
+              sized.status !== "SIZED" ||
+              sized.sizeUsdt === null ||
+              !sized.quote ||
+              !sized.economics
+            ) {
+              return [];
+            }
+            const economics = sized.economics;
+            return [
+              {
+                lifecycleId: route.routeKey,
+                routeKey: route.routeKey,
+                buySourceId: route.buySourceId,
+                sellSourceId: route.sellSourceId,
+                sizeUsdt: sized.sizeUsdt,
+                buyVwapToman: sized.quote.buyVwapToman,
+                sellVwapToman: sized.quote.sellVwapToman,
+                riskAdjustedPnlToman: economics.riskAdjustedPnlToman,
+                economicNetPnlToman: economics.economicNetPnlToman,
+                buyNotionalToman: sized.quote.buyWalk.notionalToman,
+                buyIrtRequiredToman: economics.buyDebitIrtToman,
+                sellUsdtMicros: economics.sellDebitUsdtMicros,
+                capitalLockedToman: economics.capitalLockedToman,
+                buyAcceptedDepthToman:
+                  microsToUsdt(sized.capacity?.buyDepth.depthMicros ?? 0) *
+                  sized.quote.buyVwapToman,
+                sellAcceptedDepthToman:
+                  microsToUsdt(sized.capacity?.sellDepth.depthMicros ?? 0) *
+                  valuationPriceToman,
+                inventoryImpactPoints: sized.inventory?.impactPoints ?? 0,
+                inventoryDeltas: [
+                  {
+                    sourceId: route.buySourceId,
+                    deltaIrtToman: -economics.buyDebitIrtToman,
+                    deltaUsdtMicros:
+                      Math.round(sized.sizeUsdt * 1_000_000) -
+                      economics.buyFeeUsdtMicros
+                  },
+                  {
+                    sourceId: route.sellSourceId,
+                    deltaIrtToman:
+                      sized.quote.sellWalk.notionalToman -
+                      economics.sellFeeToman,
+                    deltaUsdtMicros: -economics.sellDebitUsdtMicros
+                  }
+                ],
+                readiness: { healthy: true, fresh: true, feeCertain: true }
+              }
+            ];
+          }),
+          equityToman: snap.session.totalCapitalToman,
+          markPriceToman: valuationPriceToman,
+          venueExposureToman: new Map(),
+          availableIrtByVenue: new Map(
+            sizingBalances.map((balance) => [
+              balance.sourceId as string,
+              balance.irtToman
+            ])
+          ),
+          availableUsdtMicrosByVenue: new Map(
+            sizingBalances.map((balance) => [
+              balance.sourceId as string,
+              balance.usdtMicros
+            ])
+          ),
+          maxUtilizationPercent: PAPER_PORTFOLIO_MAX_UTILIZATION_PERCENT,
+          minReservePercent: PAPER_PORTFOLIO_MIN_RESERVE_PERCENT,
+          maxVenueExposurePercent:
+            PAPER_PORTFOLIO_FAILSAFE_VENUE_PERCENT,
+          inventoryFeasible(candidates) {
+            const deltas = new Map<
+              string,
+              {
+                sourceId: string;
+                deltaIrtToman: number;
+                deltaUsdtMicros: number;
+              }
+            >();
+            for (const candidate of candidates) {
+              for (const delta of candidate.inventoryDeltas ?? []) {
+                const aggregate = deltas.get(delta.sourceId) ?? {
+                  sourceId: delta.sourceId,
+                  deltaIrtToman: 0,
+                  deltaUsdtMicros: 0
+                };
+                aggregate.deltaIrtToman += delta.deltaIrtToman;
+                aggregate.deltaUsdtMicros += delta.deltaUsdtMicros;
+                deltas.set(delta.sourceId, aggregate);
+              }
+            }
+            return (
+              !deltas.size ||
+              assessInventory({
+                balances: sizingBalances,
+                deltas: [...deltas.values()],
+                model: inventoryModel
+              }).withinBand
+            );
+          }
+        })
+      : null;
+
+  /*
+   * Four DIFFERENT facts, counted separately.
+   *
+   * "9/9 executable" collapsed all of them into one number and implied a
+   * readiness nobody established: KYC says who we are, capacity says whether
+   * the market data supports sizing, the role says what the plan funds it for,
+   * and route-usable says whether it can actually take a trade this cycle. A
+   * venue can be first without being last.
+   */
+  const venueSemantics = (() => {
+    /*
+     * Usability is PER LEG. Arbitrage needs one venue to buy on and another to
+     * sell on; a venue that can only buy is still a full participant. Requiring
+     * both directions of the same venue was the mistake that excluded a dealer
+     * whose buy leg was perfectly usable.
+     *
+     * Usability is also NOT profitability: a leg is usable when the cycle can
+     * size it, whether or not the resulting trade happens to be worth taking.
+     */
+    const buyUsable = new Set<string>();
+    const sellUsable = new Set<string>();
+    for (const r of sizingRoutes) {
+      if (!r.sizing.candidates.length) continue;
+      buyUsable.add(r.buySourceId);
+      sellUsable.add(r.sellSourceId);
+    }
+
+    const matrix = wizardReadiness.map((r) => {
+      const cap = venueCapacities.find((v) => v.sourceId === r.sourceId);
+      const role =
+        latestProposalRows.find((x) => x.sourceId === r.sourceId)?.role ?? null;
+      const buyOk = buyUsable.has(r.sourceId);
+      const sellOk = sellUsable.has(r.sourceId);
+      return {
+        sourceId: r.sourceId,
+        nameFa: r.nameFa,
+        dataType: cap?.marketModel === "OTC_QUOTE" ? "EXECUTABLE_QUOTE" : "ORDER_BOOK",
+        kycComplete: r.kycComplete,
+        accountEligible: r.executionEligible,
+        feeConfirmed: r.takerFeeBps !== null,
+        buyCapacityUsdtMicros: cap?.buy.capacityUsdtMicros ?? null,
+        sellCapacityUsdtMicros: cap?.sell.capacityUsdtMicros ?? null,
+        buyLimiter: cap?.buy.limitingCap ?? null,
+        sellLimiter: cap?.sell.limitingCap ?? null,
+        buyReason: cap?.buy.reason ?? "no_balance_record",
+        sellReason: cap?.sell.reason ?? "no_balance_record",
+        buyLegUsable: buyOk,
+        sellLegUsable: sellOk,
+        // One valid leg is enough to participate in arbitrage.
+        participates: buyOk || sellOk,
+        allocationRole: role,
+        blockerFa:
+          buyOk || sellOk
+            ? null
+            : (cap?.buy.reasonFa ?? "هیچ مسیری با این صرافی در این چرخه قابل اندازه‌گیری نبود")
+      };
+    });
+
+    return {
+      total: wizardReadiness.length,
+      kycConfirmed: wizardReadiness.filter((r) => r.kycComplete).length,
+      accountEligible: wizardReadiness.filter((r) => r.executionEligible).length,
+      buyCapacityMeasurable: matrix.filter((m) => m.buyCapacityUsdtMicros !== null).length,
+      sellCapacityMeasurable: matrix.filter((m) => m.sellCapacityUsdtMicros !== null).length,
+      buyLegUsable: matrix.filter((m) => m.buyLegUsable).length,
+      sellLegUsable: matrix.filter((m) => m.sellLegUsable).length,
+      participating: matrix.filter((m) => m.participates).length,
+      quoteOnly: matrix
+        .filter((m) => m.dataType === "EXECUTABLE_QUOTE")
+        .map((m) => ({ sourceId: m.sourceId, buyReason: m.buyReason, sellReason: m.sellReason })),
+      unverified: matrix
+        .filter((m) => m.buyCapacityUsdtMicros === null && m.sellCapacityUsdtMicros === null)
+        .map((m) => ({ sourceId: m.sourceId, reason: m.buyReason, reasonFa: m.blockerFa ?? "" })),
+      matrix
+    };
+  })();
+
+  const sizing = {
+    /** The policy in force. The UI names it rather than inferring it. */
+    policy: SMART_SIZING_POLICY,
+    policyParameters: {
+      candidatePercents: CANDIDATE_PERCENTS,
+      capitalCapPercent: CAPITAL_CAP_PERCENT,
+      depthCapPercent: DEPTH_CAP_PERCENT,
+      /** Accounting precision only — not an executable trade floor. */
+      ledgerSizeQuantumUsdt: LEDGER_SIZE_QUANTUM_MICROS / 1_000_000,
+      /**
+       * Admin-approved global Paper minimum (USDT). Label: paper_policy_min.
+       * Not an official exchange limit. Paper never sizes below this.
+       * Effective floor = max(paper_policy_min, verified venue min).
+       */
+      paperPolicyMinUsdt: PAPER_POLICY_MIN_USDT,
+      paperPolicyMinKey: PAPER_POLICY_MIN_KEY,
+      /** @deprecated Prefer paperPolicyMinUsdt — kept for older UI readers. */
+      minExecutableUsdt: PAPER_POLICY_MIN_USDT,
+      /** Verified venue limit count in-process (LIVE readiness; not Paper floor). */
+      verifiedVenueLimitCount: listVenueExecutionLimits().length
+    },
+    requiredPolicies: SIZING_REQUIRED_POLICIES,
+    venueSemantics,
+    venueCapacities,
+    missingPolicies: SIZING_REQUIRED_POLICIES.filter(
+      (k) => !policies.find((p) => p.definition.key === k)?.configured
+    ),
+    /**
+     * The fixed ladder, still collected as a book PROBE and still shown as a
+     * comparison baseline. It is not a sizing input and never executes.
+     */
+    probeSizesUsdt: SHADOW_TRADE_SIZES,
+    baselineSizesUsdt: BASELINE_FIXED_SIZES_USDT,
+    baselineExecutable: false,
+    inventory: {
+      valuationPriceToman: inventoryModel.valuationPriceToman,
+      maxDeviationPoints: inventoryModel.maxDeviationPoints,
+      targets: inventoryModel.targets
+    },
+    portfolio: portfolioAllocation
+      ? {
+          algorithm: portfolioAllocation.algorithm,
+          ...portfolioAllocation.telemetry,
+          selectedRoutes: portfolioAllocation.selected.map((selection) => ({
+            routeKey: selection.candidate.routeKey,
+            sizeUsdt: selection.candidate.sizeUsdt,
+            allocatedCapitalToman: selection.capitalUsedToman,
+            riskAdjustedPnlToman:
+              selection.candidate.riskAdjustedPnlToman
+          })),
+          rejectedRoutes: portfolioAllocation.rejected,
+          dynamicVenueCaps: portfolioAllocation.dynamicVenueCaps
+        }
+      : null,
+    routes: sizingRoutes
+  };
+
+  /*
+   * Compact, read-only operator path. It deliberately returns before proposal,
+   * experiment-history, accounting and ledger pagination queries. The engine
+   * and the operator can therefore share the same DB without a slow reporting
+   * aggregation hiding the current cycle or sizing decision.
+   */
+  /*
+   * Phase 8C-5 — the latest persisted proposal and what was decided about it.
+   * Loaded on every read so a refresh shows the same proposal, status and
+   * audit result rather than an empty panel.
+   */
+  const [latestProposals, latestDecisions] = await Promise.all([
+    listProposals(1),
+    listDecisions(undefined, 1)
+  ]);
+  const latestProposal = latestProposals[0] ?? null;
+  const latestDecision =
+    latestProposal && latestDecisions[0]?.proposalId === latestProposal.id
+      ? latestDecisions[0]
+      : ((await listDecisions(latestProposal?.id, 1))[0] ?? null);
+
+  /*
+   * Scenario caps are recorded in the note as `SCENARIO {...}`. Parsing them
+   * back means the controls repopulate after a hard reload instead of silently
+   * resetting to UNSET, which would misrepresent what the proposal was built on.
+   */
+  let scenarioCaps: Record<string, number> | null = null;
+  const scenarioMatch = latestProposal?.note?.match(/^SCENARIO (\{.*?\})/);
+  if (scenarioMatch) {
+    try {
+      scenarioCaps = JSON.parse(scenarioMatch[1]) as Record<string, number>;
+    } catch {
+      scenarioCaps = null;
+    }
+  }
+
+  const allocation = {
+    proposal: latestProposal ? { ...latestProposal, scenarioCaps } : null,
+    decision: latestDecision
+      ? {
+          decision: latestDecision.decision,
+          detailFa: latestDecision.detailFa,
+          decidedBy: latestDecision.decidedBy,
+          decidedAt: String(latestDecision.decidedAt)
+        }
+      : null,
+    /** What the engine would apply right now — for the staleness banner. */
+    currentFingerprintsAvailable: true
+  };
+
+  /*
+   * Portfolio accounting for «سرمایه و حساب» and «سفارش‌ها و پوزیشن‌ها».
+   * Server-authoritative mark and as-of; open orders/positions are empty when
+   * the broker is immediate-fill — that is reported, never faked.
+   */
+  const asOf = new Date().toISOString();
+  const markForAccounting =
+    wizard.markPriceToman ?? snap.session?.valuationPriceToman ?? null;
+  const accounting = snap.session
+    ? buildPortfolioAccounting({
+        asOf,
+        initialCapitalToman: snap.session.totalCapitalToman,
+        markPriceToman: markForAccounting,
+        balances: sizingBalances,
+        opening: snap.session.openingAllocations ?? [],
+        fills: [...(snap.trades ?? []), ...(snap.legRisks ?? [])].map(
+          (t): AccountingFill => ({
+            id: t.id,
+            lifecycleId: t.lifecycleId,
+            routeKey: t.routeKey,
+            buySourceId: t.buySourceId,
+            sellSourceId: t.sellSourceId,
+            sizeUsdt: t.sizeUsdt,
+            buyVwapToman: t.buyVwapToman,
+            sellVwapToman: t.sellVwapToman,
+            buyNotionalToman: t.buyNotionalToman,
+            sellNotionalToman: t.sellNotionalToman,
+            feeTomanTotal: t.feeTomanTotal,
+            feeUsdtMicrosTotal: t.feeUsdtMicrosTotal,
+            sellFeeValueToman: t.sellFeeValueToman,
+            grossSpreadToman: t.grossSpreadToman,
+            cashPnlIrtToman: t.cashPnlIrtToman,
+            riskAdjustedPnlToman: t.riskAdjustedPnlToman,
+            economicNetPnlToman: t.economicNetPnlToman,
+            slippageBufferToman: t.slippageBufferToman,
+            markPriceToman: t.markPriceToman,
+            occurredAt: t.occurredAt,
+            outcome: t.outcome,
+            inventoryDeltaUsdtMicros: t.inventoryDeltaUsdtMicros
+          })
+        ),
+        todayStartMs: tehranDayStartMs(Date.parse(asOf))
+      })
+    : null;
+
+  /*
+   * Per-venue market depth for the capital cards — same cycle as sizing and
+   * venueCapacities. One snapshot map; no extra network fetch.
+   */
+  const maxSlippagePolicy = policies.find((p) => p.definition.key === "max_slippage_bps");
+  const maxSlippageBps = maxSlippagePolicy?.configured
+    ? ((maxSlippagePolicy.value as number) ?? null)
+    : null;
+  const smartByVenue = new Map<
+    string,
+    { sizeUsdt: number; routeKey: string; binding: string | null }
+  >();
+  for (const r of sizingRoutes) {
+    if (r.sizing.status !== "SIZED" || r.sizing.sizeUsdt === null) continue;
+    for (const sid of [r.buySourceId, r.sellSourceId]) {
+      const prev = smartByVenue.get(sid);
+      if (!prev || r.sizing.sizeUsdt > prev.sizeUsdt) {
+        smartByVenue.set(sid, {
+          sizeUsdt: r.sizing.sizeUsdt,
+          routeKey: r.routeKey,
+          binding: r.sizing.bindingConstraint ?? null
+        });
+      }
+    }
+  }
+  const venueDepthCards = wizard.eligibleVenues.map((v) => {
+    const sn = snapshotById.get(v.sourceId);
+    const balance = sizingBalances.find((b) => (b.sourceId as string) === v.sourceId);
+    const smart = smartByVenue.get(v.sourceId);
+    return buildVenueDepthCard({
+      sourceId: v.sourceId,
+      nameFa: v.nameFa,
+      marketModel: sn?.marketModel ?? "ORDER_BOOK",
+      bookBids: sn?.bookBids ?? null,
+      bookAsks: sn?.bookAsks ?? null,
+      irtToman: balance?.irtToman ?? null,
+      usdtMicros: balance?.usdtMicros ?? null,
+      feeBps: feeBpsById.get(v.sourceId) ?? null,
+      buyFeeAsset: settlementFor(v.sourceId as ShadowSourceId, "buy").feeAsset,
+      sellFeeAsset: settlementFor(v.sourceId as ShadowSourceId, "sell").feeAsset,
+      capitalShareToman: allocationTomanBySource.get(v.sourceId) ?? null,
+      policyOrderSizeMicros,
+      policyExposureMicros: null,
+      maxSlippageBps,
+      markPriceToman: markForAccounting,
+      sourceFailureFa: sn?.errorReason ?? sn?.degradedReason ?? null,
+      stale: Boolean(sn?.stale),
+      maxQuoteAgeMs: maxQuoteAgeMsPolicy,
+      snapshotAgeMs: sn?.ageMs ?? null,
+      quote:
+        sn?.marketModel === "OTC_QUOTE"
+          ? {
+              userBuyPriceToman: sn.userBuyPriceToman,
+              userSellPriceToman: sn.userSellPriceToman,
+              maxExecutableUsdt: sn.maxExecutableUsdt,
+              ageMs: sn.ageMs,
+              stale: sn.stale,
+              maxQuoteAgeMs: maxQuoteAgeMsPolicy
+            }
+          : undefined,
+      smartRecommendedUsdt: smart?.sizeUsdt ?? null,
+      smartRouteKey: smart?.routeKey ?? null,
+      smartBindingConstraint: smart?.binding ?? null,
+      asOf
+    });
+  });
+
+  let experiment: unknown = null;
+  let experimentRows: Array<{
+    id: string;
+    runKey: string;
+    status: string;
+    startedAt: string;
+    endsAt: string;
+    sessionId: string | null;
+    initialCapitalToman: number;
+    summary: Record<string, unknown> | null;
+    policySetKey: string;
+  }> = [];
+  try {
+    const { getActiveExperiment, listExperiments, formatTehranWithSeconds } = await import(
+      "@/db/repositories/shadowExperiments"
+    );
+    const active = await getActiveExperiment();
+    const all = await listExperiments(10);
+    experimentRows = all.map((e) => ({
+      id: e.id,
+      runKey: e.runKey,
+      status: e.status,
+      startedAt: e.startedAt,
+      endsAt: e.endsAt,
+      sessionId: e.sessionId,
+      initialCapitalToman: e.initialCapitalToman,
+      summary: e.summary,
+      policySetKey: e.policySetKey
+    }));
+    const pick = active ?? all[0] ?? null;
+    if (pick) {
+      const avg =
+        pick.utilizationStats.n > 0
+          ? pick.utilizationStats.sum / pick.utilizationStats.n
+          : null;
+      const nowMs = Date.now();
+      const endsMs = Date.parse(pick.endsAt);
+      const startMs = Date.parse(pick.startedAt);
+      const sessionForPick =
+        history.find((s) => s.id === pick.sessionId || s.experimentRunId === pick.id) ??
+        snap.session ??
+        null;
+      const setup = parseSessionSetupNote(sessionForPick?.note);
+      const configuredDurationDays =
+        setup?.durationDays && setup.durationDays > 0
+          ? setup.durationDays
+          : durationDaysFromIso(pick.startedAt, pick.endsAt);
+      experiment = {
+        id: pick.id,
+        runKey: pick.runKey,
+        status: pick.status,
+        policySetKey: pick.policySetKey,
+        policyFingerprint: pick.policyFingerprint,
+        releaseVersion: pick.releaseVersion,
+        startedAt: pick.startedAt,
+        endsAt: pick.endsAt,
+        startedAtTehran: formatTehranWithSeconds(pick.startedAt),
+        endsAtTehran: formatTehranWithSeconds(pick.endsAt),
+        elapsedMs: Math.max(0, nowMs - startMs),
+        remainingMs: pick.status === "ACTIVE" ? Math.max(0, endsMs - nowMs) : 0,
+        initialCapitalToman: pick.initialCapitalToman,
+        targetUtilizationPercent: pick.targetUtilizationPercent,
+        maxUtilizationPercent: pick.maxUtilizationPercent,
+        minReservePercent: pick.minReservePercent,
+        maxRouteCapitalPercent: pick.maxRouteCapitalPercent,
+        maxVenueExposurePercent: pick.maxVenueExposurePercent,
+        derivedMaxOrderUsdt: pick.derivedMaxOrderUsdt,
+        derivedMaxOrderReferencePrice: pick.derivedMaxOrderReferencePrice,
+        peakUtilizationPercent: pick.peakUtilizationPercent,
+        averageUtilizationPercent: avg,
+        sessionId: pick.sessionId,
+        summary: pick.summary,
+        configuredDurationDays,
+        filled: snap.stats?.filled ?? null,
+        skipped: snap.stats?.skipped ?? null,
+        lastFillAt: snap.stats?.lastFillAt ?? null,
+        lastCycleAt: snap.session?.lastCycleAt ?? null,
+        history: all.map((e) => ({
+          id: e.id,
+          runKey: e.runKey,
+          status: e.status,
+          startedAt: e.startedAt,
+          endsAt: e.endsAt,
+          policySetKey: e.policySetKey
+        }))
+      };
+    }
+  } catch {
+    experiment = null;
+  }
+
+  const sessionHistory = history.map((s) => {
+    const setup = parseSessionSetupNote(s.note);
+    const exp =
+      experimentRows.find((e) => e.id === s.experimentRunId || e.sessionId === s.id) ?? null;
+    const startedAt = s.startedAt ?? setup?.startedAt ?? exp?.startedAt ?? null;
+    const configuredEnds = setup?.endsAt ?? exp?.endsAt ?? null;
+    const endedAt = s.stoppedAt ?? (s.status === "STOPPED" ? configuredEnds : null);
+    const isActive = snap.session?.id === s.id;
+    const acc = isActive ? accounting : null;
+    return {
+      id: s.id,
+      name: s.name ?? null,
+      status: s.status,
+      operatorStatus: operatorStatusFa(s.status, exp?.status ?? null),
+      startedAt,
+      endedAt,
+      configuredEndsAt: configuredEnds,
+      configuredDurationDays:
+        setup?.durationDays && setup.durationDays > 0
+          ? setup.durationDays
+          : durationDaysFromIso(startedAt, configuredEnds),
+      capitalToman: s.totalCapitalToman,
+      tradesExecuted: s.tradesExecuted,
+      skipped: s.candidatesSkipped,
+      realizedEconomicPnlToman: acc
+        ? acc.realizedEconomicPnlToman
+        : summaryNum(exp?.summary, "economicNetPnlToman"),
+      riskAdjustedPnlToman: acc
+        ? acc.realizedRiskAdjustedPnlToman
+        : summaryNum(exp?.summary, "riskAdjustedPnlToman"),
+      cashPnlIrtToman: acc ? acc.realizedCashPnlToman : summaryNum(exp?.summary, "cashPnlIrtToman"),
+      feesToman: acc ? acc.fees.totalFeeTomanEquivalent : summaryNum(exp?.summary, "feeTomanTotal"),
+      experimentId: s.experimentRunId,
+      experimentStatus: exp?.status ?? null
+    };
+  });
+
+  // Server-side ledger pagination (no silent 2000-row cap for UI).
+  const ledgerLimit = Math.min(200, Math.max(1, Number(requestUrl.searchParams.get("ledgerLimit") ?? 50) || 50));
+  const ledgerOffset = Math.max(0, Number(requestUrl.searchParams.get("ledgerOffset") ?? 0) || 0);
+  let ledgerPage: { rows: unknown[]; total: number; limit: number; offset: number } | null =
+    null;
+  if (snap.session?.id) {
+    try {
+      const [pageRows, total] = await Promise.all([
+        loadPaperLedger(snap.session.id, {
+          outcome: "FILLED",
+          limit: ledgerLimit,
+          offset: ledgerOffset
+        }),
+        countPaperLedger(snap.session.id, { outcome: "FILLED" })
+      ]);
+      ledgerPage = {
+        rows: pageRows,
+        total,
+        limit: ledgerLimit,
+        offset: ledgerOffset
+      };
+    } catch {
+      ledgerPage = null;
+    }
+  }
+
+  return new NextResponse(
+    JSON.stringify(
+      envelope({
+        ...snap,
+        accounting,
+        venueDepthCards,
+        experiment,
+        sessionHistory,
+        ledgerPage,
+        history,
+        wizard,
+        sizing,
+        allocation,
+        /**
+         * Typed identity — never invent/relabel experiment as observation.
+         * observationId is only paper.session.observationId when it is a real
+         * observation session id; experiment is separate.
+         */
+        typedIdentity: {
+          paperSessionId: snap.session?.id ?? null,
+          paperSessionStatus: snap.session?.status ?? null,
+          observationId: snap.session?.observationId ?? null,
+          experimentId:
+            experiment && typeof experiment === "object" && "id" in (experiment as object)
+              ? ((experiment as { id?: string }).id ?? null)
+              : null,
+          experimentRunKey:
+            experiment && typeof experiment === "object" && "runKey" in (experiment as object)
+              ? ((experiment as { runKey?: string }).runKey ?? null)
+              : null,
+          collectorRunId: null,
+          deploymentVersion: null
+        }
+      })
+    ),
+    {
+      status: 200,
+      headers: SHADOW_NO_STORE
+    }
+  );
+}
+
+/**
+ * Actions: `create`, `start`, `pause`, `resume`, `stop`.
+ * None of them can trade — `start` only flips a database status so the engine
+ * begins evaluating cycles that already happened.
+ */
+export async function POST(request: Request) {
+  const session = await requireAdminSession();
+  if (!isSession(session)) return session;
+
+  let body: Record<string, unknown>;
+  try {
+    if (request.headers.get("content-type")?.includes("application/json")) {
+      body = (await request.json()) as Record<string, unknown>;
+    } else {
+      body = Object.fromEntries(await request.formData());
+    }
+  } catch {
+    return bad("بدنهٔ JSON نامعتبر");
+  }
+
+  if (FORBIDDEN_FIELDS.some((k) => k in body)) {
+    return bad("اجرای کاغذی هیچ کلید API یا اطلاعات محرمانه‌ای نمی‌پذیرد.", "forbidden_field");
+  }
+
+  const action = String(body.action ?? "");
+  if (
+    ![
+      "create",
+      "start",
+      "pause",
+      "resume",
+      "stop",
+      "propose_allocation",
+      "apply_allocation",
+      "reconcile_leg_risk"
+    ].includes(action)
+  ) {
+    return bad("عملیات نامعتبر است");
+  }
+
+  /*
+   * Explicit Paper LEG_RISK reconciliation: audit-only closure. Never deletes
+   * LEG_RISK, never mutates balances, never invents hedges/fills.
+   */
+  if (action === "reconcile_leg_risk") {
+    if (body.confirm !== true) {
+      return bad("reconcile_leg_risk نیازمند confirm: true است", "confirmation_required", 400);
+    }
+    const sessionId = typeof body.sessionId === "string" ? body.sessionId : null;
+    const ledgerId = typeof body.ledgerId === "string" ? body.ledgerId : null;
+    if (!sessionId || !ledgerId) {
+      return bad("sessionId و ledgerId الزامی است", "bad_request", 400);
+    }
+    const evidence =
+      body.evidence && typeof body.evidence === "object" && !Array.isArray(body.evidence)
+        ? (body.evidence as Record<string, unknown>)
+        : null;
+    if (!evidence || Object.keys(evidence).length === 0) {
+      return bad("evidence الزامی است (شواهد آشتی Paper)", "evidence_required", 400);
+    }
+    const target = await getPaperSession(sessionId);
+    if (!target) return bad("نشست کاغذی یافت نشد.", "not_found", 404);
+    try {
+      const closure = await reconcilePaperLegRisk({
+        sessionId,
+        ledgerId,
+        closedBy: session.u ?? "admin",
+        evidence,
+        note: typeof body.note === "string" ? body.note : null
+      });
+      const unresolved = await listUnresolvedLegRiskRows(sessionId);
+      return new NextResponse(
+        JSON.stringify({
+          action: "reconcile_leg_risk",
+          closure,
+          unresolvedCount: unresolved.length,
+          unresolved,
+          paperOnly: true,
+          realOrders: false,
+          balancesMutated: false
+        }),
+        { status: 200, headers: SHADOW_NO_STORE }
+      );
+    } catch (error) {
+      return bad(
+        error instanceof Error ? error.message : "آشتی LEG_RISK ناموفق بود",
+        "reconcile_failed",
+        409
+      );
+    }
+  }
+
+  /*
+   * Phase 8C-5 — allocation proposals.
+   *
+   * `propose_allocation` only computes and stores; it never changes a balance.
+   * `apply_allocation` is the single explicit step that does, and it refuses a
+   * proposal whose evidence has moved. Neither can place an order.
+   */
+  if (action === "propose_allocation" || action === "apply_allocation") {
+    const ctx = await buildAllocationContext();
+    if (!ctx.ok) return bad(ctx.messageFa, "allocation_unavailable");
+
+    if (action === "propose_allocation") {
+      /*
+       * Scenario caps let an administrator ask "what would this look like if
+       * the limit were X" WITHOUT approving X. A proposal built on them is
+       * marked PREVIEW and can never be applied — applying a plan shaped by an
+       * unapproved limit would launder a guess into the active allocation.
+       *
+       * `null` means UNSET (not applied); an explicit 0 is a real value and
+       * stays distinct from it.
+       */
+      const raw = (body.scenarioCaps ?? {}) as Record<string, unknown>;
+      const scenarioCaps: Record<string, number> = {};
+      for (const [k, v] of Object.entries(raw)) {
+        if (v === null || v === undefined || v === "") continue;
+        const n = Number(v);
+        if (Number.isFinite(n) && n >= 0) scenarioCaps[k] = n;
+      }
+      const isScenario = Object.keys(scenarioCaps).length > 0;
+
+      const plan = buildLiquidityAwarePlan({
+        totalCapitalToman: ctx.totalCapitalToman,
+        valuationPriceToman: ctx.valuationPriceToman,
+        venueIds: ctx.venueIds,
+        observations: ctx.observations
+      });
+      if (plan.residualToman !== 0) {
+        return bad(`پیشنهاد حفظ سرمایه را نقض کرد: باقی‌مانده ${plan.residualToman}`);
+      }
+      const stored = await recordProposal({
+        totalCapitalToman: plan.totalCapitalToman,
+        valuationPriceToman: plan.valuationPriceToman,
+        allocatedToman: plan.allocatedToman,
+        residualToman: plan.residualToman,
+        rows: plan.rows.map((r) => {
+          const cap = ctx.capacityBySource.get(r.sourceId);
+          return {
+            sourceId: r.sourceId,
+            role: r.role,
+            irtToman: r.irtToman,
+            usdtUnits: r.usdtUnits,
+            valueToman: r.valueToman,
+            sharePercent: r.sharePercent,
+            buyCapacityUsdtMicros: cap?.buy.capacityUsdtMicros ?? null,
+            sellCapacityUsdtMicros: cap?.sell.capacityUsdtMicros ?? null,
+            buyLimiter: cap?.buy.limitingCap ?? null,
+            sellLimiter: cap?.sell.limitingCap ?? null,
+            buyReason: cap?.buy.reason ?? "no_balance_record",
+            sellReason: cap?.sell.reason ?? "no_balance_record",
+            reasonFa: r.reasonFa
+          };
+        }),
+        fingerprints: ctx.fingerprints,
+        appliedPolicyCaps: { ...ctx.appliedPolicyCaps, ...scenarioCaps },
+        unsetPolicyCaps: ctx.unsetPolicyCaps.filter((k) => !(k in scenarioCaps)),
+        observations: ctx.observations,
+        createdBy: session.u ?? "admin",
+        status: isScenario ? "PREVIEW" : "PROPOSED",
+        scenarioCaps: isScenario ? scenarioCaps : null,
+        note: typeof body.note === "string" ? body.note.slice(0, 500) : null
+      });
+      return new NextResponse(
+        JSON.stringify(envelope({ proposal: stored, warningsFa: plan.errorsFa })),
+        { status: 200, headers: SHADOW_NO_STORE }
+      );
+    }
+
+    const proposalId = String(body.proposalId ?? "");
+    const idempotencyKey = String(body.idempotencyKey ?? "");
+    if (!proposalId || !idempotencyKey) {
+      return bad("شناسهٔ پیشنهاد و کلید یکتاسازی الزامی است");
+    }
+    if (!ctx.sessionId) return bad("برای اعمال تخصیص، یک نشست کاغذی لازم است");
+
+    const outcome = await applyProposal({
+      proposalId,
+      sessionId: ctx.sessionId,
+      idempotencyKey,
+      currentFingerprints: ctx.fingerprints,
+      decidedBy: session.u ?? "admin"
+    });
+    return new NextResponse(JSON.stringify(envelope({ outcome })), {
+      status: outcome.ok || outcome.idempotentReplay ? 200 : 409,
+      headers: SHADOW_NO_STORE
+    });
+  }
+
+  if (action === "create") {
+    const mode: PaperSessionMode =
+      body.mode === "APPROVED_PLAN" ? "APPROVED_PLAN" : "PROVISIONAL_EVALUATION";
+
+    const [latestFees, snapshots, observation, savedPlan, approvalRow] = await Promise.all([
+      loadEffectiveFees(Date.now()),
+      loadLatestSourceSnapshots(),
+      getObservation(),
+      loadLatestCapitalPlan(),
+      loadLatestCapitalApproval()
+    ]);
+
+    const valuationPriceToman = deriveValuationPrice(snapshots);
+    if (valuationPriceToman === null) {
+      return bad(
+        "قیمت ارزش‌گذاری تتر در دسترس نیست؛ نشست کاغذی بدون آن ساخته نمی‌شود.",
+        "unavailable",
+        503
+      );
+    }
+
+    const accountEvidence = await loadLatestAccountConfirmations();
+    const readiness = buildAllReadiness(
+      latestFees.overrides,
+      Date.now(),
+      Object.values(accountEvidence),
+      latestFees.blocks
+    );
+    const venueStates = classifyAllVenues(readiness);
+
+    let plan: CapitalPlanInput;
+    let approvalFingerprint: string | null = null;
+
+    if (mode === "APPROVED_PLAN") {
+      // Only a Phase 5 approval that still holds may back a session.
+      if (!savedPlan || !approvalRow) {
+        return bad("هیچ طرح تأییدشده‌ای برای شروع نشست وجود ندارد.", "not_eligible", 409);
+      }
+      plan = {
+        totalCapitalToman: savedPlan.totalCapitalToman,
+        valuationPriceToman,
+        allocations: savedPlan.allocations.filter((a) =>
+          VALID_IDS.has(a.sourceId)
+        ) as CapitalPlanInput["allocations"],
+        mode: savedPlan.mode
+      };
+      const recommendation = evaluateRecommendation({
+        plan,
+        states: venueStates,
+        observation: observation
+          ? {
+              status: observation.status,
+              successCoveragePercent: observation.successCoveragePercent,
+              elapsedMs: observation.elapsedMs,
+              targetDurationMs: observation.targetDurationMs
+            }
+          : null,
+        approval: {
+          approvedBy: approvalRow.approvedBy,
+          approvedAt: approvalRow.approvedAt,
+          readinessFingerprint: approvalRow.readinessFingerprint,
+          planFingerprint: approvalRow.planFingerprint
+        }
+      });
+      if (recommendation.status !== "APPROVED_SIMULATION_PLAN") {
+        return new NextResponse(
+          JSON.stringify({
+            error: "not_eligible",
+            message: `تأیید معتبر فاز ۵ وجود ندارد. ${recommendation.reasonFa}`,
+            recommendation
+          }),
+          { status: 409, headers: SHADOW_NO_STORE }
+        );
+      }
+      approvalFingerprint = `${planFingerprint(plan)}|${readinessFingerprint(venueStates)}`;
+    } else if (Array.isArray(body.allocations)) {
+      /*
+       * A snapshot of the capital plan the admin just reviewed.
+       *
+       * The client proposes; the server re-checks everything that matters: the
+       * venues must be execution-eligible, and the allocation must conserve the
+       * stated total exactly at the mark price derived here, not at whatever
+       * price the client happened to see. A residual of even one toman is
+       * refused rather than rounded away.
+       */
+      const eligibleIds = venueStates.filter((v) => v.executable).map((v) => v.sourceId);
+      const allocations = (body.allocations as VenueAllocation[]).map((a) => ({
+        sourceId: String(a.sourceId),
+        irtToman: Math.round(Number(a.irtToman) || 0),
+        usdtUnits: Number(a.usdtUnits) || 0
+      }));
+      const totalCapitalToman = Math.round(Number(body.totalCapitalToman) || 0);
+
+      const validation = validateAllocation({
+        totalCapitalToman,
+        allocations,
+        markPriceToman: valuationPriceToman,
+        eligibleVenueIds: eligibleIds
+      });
+      if (!validation.ok) {
+        return new NextResponse(
+          JSON.stringify({
+            error: "invalid_allocation",
+            message: validation.errorsFa.join(" "),
+            validation
+          }),
+          { status: 400, headers: SHADOW_NO_STORE }
+        );
+      }
+
+      plan = {
+        totalCapitalToman,
+        valuationPriceToman,
+        allocations: allocations.filter((a) =>
+          VALID_IDS.has(a.sourceId)
+        ) as CapitalPlanInput["allocations"],
+        mode: "MANUAL"
+      };
+    } else {
+      // Provisional evaluation runs on a draft 50,000,000-toman virtual plan.
+      plan = buildOptimizedPlan({
+        totalCapitalToman: DEFAULT_CAPITAL_TOMAN,
+        valuationPriceToman,
+        readiness,
+        routes: []
+      }).plan;
+      if (!plan.allocations.length) {
+        return bad(
+          "هیچ صرافی اجراپذیری برای ساخت طرح آزمایشی وجود ندارد.",
+          "not_eligible",
+          409
+        );
+      }
+    }
+
+    const created = await createPaperSession({
+      observationId: observation?.id ?? null,
+      name:
+        typeof body.name === "string" && body.name.trim()
+          ? body.name.trim().slice(0, 80)
+          : mode === "APPROVED_PLAN"
+            ? "نشست کاغذی طرح تأییدشده"
+            : "ارزیابی موقت کاغذی",
+      mode,
+      totalCapitalToman: plan.totalCapitalToman,
+      valuationPriceToman,
+      openingAllocations: plan.allocations.map((a) => ({
+        sourceId: a.sourceId,
+        irtToman: a.irtToman,
+        usdtUnits: a.usdtUnits
+      })),
+      approvalFingerprint,
+      createdBy: session.u ?? "admin",
+      note: typeof body.note === "string" ? body.note.slice(0, 500) : null
+    });
+
+    return new NextResponse(
+      JSON.stringify(
+        envelope({
+          created: created.id,
+          // Creating never starts it: an admin must press start.
+          started: false,
+          ...(await snapshot()),
+          history: await listPaperSessions(20)
+        })
+      ),
+      { status: 200, headers: SHADOW_NO_STORE }
+    );
+  }
+
+  const sessionId = typeof body.sessionId === "string" ? body.sessionId : null;
+  const target = sessionId ? await getPaperSession(sessionId) : await getActivePaperSession();
+  if (!target) return bad("نشست کاغذی یافت نشد.", "not_found", 404);
+  if (target.status === "STOPPED") return bad("این نشست پایان یافته است.", "conflict", 409);
+
+  const next =
+    action === "start" || action === "resume"
+      ? "RUNNING"
+      : action === "pause"
+        ? "PAUSED"
+        : "STOPPED";
+
+  if (action === "resume" && target.status !== "PAUSED") {
+    return bad("فقط نشست متوقف‌شده را می‌توان ادامه داد.", "conflict", 409);
+  }
+  if (action === "pause" && target.status !== "RUNNING") {
+    return bad("فقط نشست در حال اجرا را می‌توان متوقف کرد.", "conflict", 409);
+  }
+
+  /*
+   * PAPER-V2 Phase 1A — refuse to start an economically valid N-day Paper run
+   * when required executable fee evidence expires before planned_end.
+   * Fail-closed: no silent extension, no compiled-default fallback.
+   */
+  if (action === "start") {
+    const setup = parseSessionSetupNote(target.note);
+    let plannedEndMs: number | null = setup?.endsAt ? Date.parse(setup.endsAt) : NaN;
+    if (!Number.isFinite(plannedEndMs)) {
+      try {
+        const { getActiveExperiment } = await import("@/db/repositories/shadowExperiments");
+        const exp = await getActiveExperiment();
+        if (exp?.sessionId === target.id && exp.endsAt) {
+          plannedEndMs = Date.parse(exp.endsAt);
+        }
+      } catch {
+        /* optional */
+      }
+    }
+    if (Number.isFinite(plannedEndMs)) {
+      const { loadEffectiveFees } = await import("@/lib/shadowArbitrage/effectiveFees");
+      const { validateFeeHorizonForRun } = await import(
+        "@/lib/shadowArbitrage/paper/feeHorizon"
+      );
+      const fees = await loadEffectiveFees(Date.now());
+      const requiredIds = target.openingAllocations.map((a) => a.sourceId);
+      const horizon = validateFeeHorizonForRun({
+        venues: fees.venues,
+        plannedEndMs: plannedEndMs as number,
+        nowMs: Date.now(),
+        requiredSourceIds: requiredIds
+      });
+      if (!horizon.ok) {
+        return new NextResponse(
+          JSON.stringify({
+            error: "fee_horizon_invalid",
+            message:
+              "شواهد کارمزد لازم تا پایان برنامه‌ریزی‌شده نشست دوام ندارد؛ نشست به‌عنوان اجرای اقتصادی معتبر شروع نمی‌شود.",
+            plannedEnd: horizon.plannedEndIso,
+            blockers: horizon.blockers.map((b) => ({
+              venue: b.sourceId,
+              mode: b.executionMode,
+              tier: b.tierLabel,
+              expiresAt: b.expiresAt,
+              reason: b.reason,
+              miss: b.miss,
+              detailFa: b.detailFa
+            }))
+          }),
+          { status: 409, headers: SHADOW_NO_STORE }
+        );
+      }
+    }
+  }
+
+  let updated;
+  try {
+    updated = await setPaperSessionStatus(target.id, next);
+  } catch (error) {
+    if (isUnresolvedLegRiskError(error)) {
+      const unresolved = await listUnresolvedLegRiskRows(target.id);
+      return new NextResponse(
+        JSON.stringify({
+          error: "unresolved_leg_risk",
+          conflict: "unresolved_leg_risk",
+          message:
+            "نشست کاغذی دارای مواجههٔ پای باز است؛ ادامه تا آشتی صریح مسدود است.",
+          sessionId: error.sessionId,
+          ledgerId: error.ledgerId,
+          lifecycleId: error.lifecycleId,
+          code: error.rejectionCode ?? "leg_risk_second_leg_failed",
+          unresolved,
+          paperOnly: true,
+          realOrders: false
+        }),
+        { status: 409, headers: SHADOW_NO_STORE }
+      );
+    }
+    return bad(
+      error instanceof Error ? error.message : "تغییر وضعیت نشست کاغذی ناموفق بود.",
+      "paper_status_change_failed",
+      409
+    );
+  }
+  // Lifecycle controls acknowledge the durable status write immediately.
+  // Rebuilding the full historical dashboard here made an otherwise successful
+  // pause look failed while the collector was running; the UI performs its own
+  // compact operator refresh after this acknowledgement.
+  return new NextResponse(
+    JSON.stringify(envelope({ action, session: updated, status: updated?.status ?? next })),
+    { status: 200, headers: SHADOW_NO_STORE }
+  );
+}

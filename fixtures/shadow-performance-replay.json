@@ -1,0 +1,28 @@
+{
+  "fixtureVersion": 2,
+  "description": "Synthetic full-book Paper event trace used as parser/fabric input; latency is measured by evaluateCycle tests, not stored here.",
+  "events": [
+    {
+      "sourceId": "nobitex",
+      "kind": "SNAPSHOT",
+      "sequence": 100,
+      "sourceEventTimestampMs": 1000000,
+      "receiveTimestampMs": 1000018,
+      "transport": "WS",
+      "endpoint": "saved://nobitex",
+      "bids": [{ "priceToman": 99900, "amountUsdt": 10000 }],
+      "asks": [{ "priceToman": 100000, "amountUsdt": 10000 }]
+    },
+    {
+      "sourceId": "tabdeal",
+      "kind": "SNAPSHOT",
+      "sequence": null,
+      "sourceEventTimestampMs": 1000005,
+      "receiveTimestampMs": 1000025,
+      "transport": "WS",
+      "endpoint": "saved://tabdeal",
+      "bids": [{ "priceToman": 101000, "amountUsdt": 10000 }],
+      "asks": [{ "priceToman": 101100, "amountUsdt": 10000 }]
+    }
+  ]
+}
